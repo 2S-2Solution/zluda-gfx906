@@ -1,0 +1,34 @@
+[package]
+name = "zluda_nvrtc"
+version = "0.0.0"
+edition = "2021"
+
+[lib]
+crate-type = ["cdylib"]
+name = "nvrtc"
+
+# NB: ZLUDA bottega italiana sovrana — wrap NVIDIA nvrtc API surface
+# (~40 funzioni) sopra hiprtc0507.dll ROCm 5.7 (18 export reali).
+# Le funzioni nvrtc-only (CUBIN/PTX/NVVM/ext linker) sono stub graceful
+# che ritornano codici di errore ABI-corretti: gli init-probe di
+# torch.compile / Triton / Inductor non crashano, possono fallire
+# graceful e fallback su path eager senza JIT.
+#
+# Caricamento dinamico via LoadLibraryW("hiprtc0507.dll") in DllMain
+# (vedi build.rs) — no link-time dependency, così la DLL gira anche
+# se il Marconi pack non è in PATH (errore graceful HIPRTC_ERROR_INVALID_PROGRAM).
+
+[dependencies]
+
+[package.metadata.zluda]
+linux_symlinks = [
+    "libnvrtc.so.11.2",
+    "libnvrtc.so.12",
+]
+# Windows: nvrtc NVIDIA pristine è multi-versione. Mappiamo le 3 release
+# che torch 2.3/2.4/2.5 + Triton 2.x/3.x effettivamente caricano.
+windows_paths = [
+    "nvrtc64_112_0.dll",
+    "nvrtc64_120_0.dll",
+    "nvrtc64_121_0.dll",
+]

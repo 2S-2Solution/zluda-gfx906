@@ -79,3 +79,45 @@ pub(crate) unsafe fn instantiate_with_flags(
 pub(crate) unsafe fn launch(graph_exec: hipGraphExec_t, stream: hipStream_t) -> hipError_t {
     hipGraphLaunch(graph_exec, stream)
 }
+
+// VEGA-PATCH 2026-06-28 sprint-orch v2 nvcuda-3: forwarder cuGraphAddKernelNode -> hipGraphAddKernelNode
+// Conversione field-by-field di CUDA_KERNEL_NODE_PARAMS_st verso hipKernelNodeParams.
+// Le due struct hanno layout di campi differente (ordine + dim3 contro 3 uint scalari),
+// quindi serve copia manuale invece di un transmute.
+pub(crate) unsafe fn add_kernel_node(
+    ph_graph_node: *mut hipGraphNode_t,
+    h_graph: hipGraph_t,
+    dependencies: *const hipGraphNode_t,
+    num_dependencies: usize,
+    node_params: *const cuda_types::cuda::CUDA_KERNEL_NODE_PARAMS_st,
+) -> hipError_t {
+    // VEGA-FIX 2026-06-28 T21:00 post-sprint-orch v2: hipError_t e' Result<(), hipErrorCode_t>. Variant si chiama InvalidValue (no prefix Error)
+    if node_params.is_null() {
+        return Err(hipErrorCode_t::InvalidValue);
+    }
+    let cu_params = &*node_params;
+    let hip_params = hipKernelNodeParams {
+        blockDim: dim3 {
+            x: cu_params.blockDimX,
+            y: cu_params.blockDimY,
+            z: cu_params.blockDimZ,
+        },
+        extra: cu_params.extra,
+        // VEGA-FIX 2026-06-28 T21:00: CUfunction e' tuple-struct newtype, serve .0 accessor
+        func: cu_params.func.0 as *mut ::core::ffi::c_void,
+        gridDim: dim3 {
+            x: cu_params.gridDimX,
+            y: cu_params.gridDimY,
+            z: cu_params.gridDimZ,
+        },
+        kernelParams: cu_params.kernelParams,
+        sharedMemBytes: cu_params.sharedMemBytes,
+    };
+    hipGraphAddKernelNode(
+        ph_graph_node,
+        h_graph,
+        dependencies,
+        num_dependencies,
+        &hip_params,
+    )
+}

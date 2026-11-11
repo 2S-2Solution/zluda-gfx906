@@ -13,7 +13,7 @@ impl Library {
     pub(crate) fn get_module_for_device(&self, device: usize) -> Result<hipModule_t, CUerror> {
         let module_lock = self.modules.get(device).ok_or(CUerror::INVALID_DEVICE)?;
         *module_lock.get_or_init(|| match self.data {
-            LibraryData::Lazy(lib) => module::load_hip_module(lib),
+            LibraryData::Lazy(lib) => module::load_hip_module(lib).map(|(m, _elf)| m),
             LibraryData::Eager(()) => Err(CUerror::NOT_SUPPORTED),
         })
     }
@@ -27,7 +27,34 @@ enum LibraryData {
 impl LibraryData {
     unsafe fn new(ptr: *mut c_void, static_lifetime: bool) -> Result<Self, CUerror> {
         if static_lifetime {
-            let lib = CodeLibraryRef::try_load(ptr).map_err(|_| CUerror::INVALID_VALUE)?;
+            // VEGA-PATCH 2026-06-28 sprint-orch v2 nvcuda-7: fallback CUBIN-only
+            // torch 2.4.1+cu121 puo' caricare via cuLibraryLoadData blob fatbinHeader
+            // contenenti SOLO sub-file CUBIN (no PTX). try_load gia' riconosce il magic
+            // FatbinHeader/FatbincWrapper/ELF, ma se il blob ha bytes iniziali "sporchi"
+            // che non matchano nessun magic noto e non sono UTF-8 (Utf8Error), prima di
+            // dare INVALID_VALUE proviamo a forzare l'interpretazione come FatbinHeader
+            // se i primi 4 byte combaciano col magic, altrimenti come ELF CUBIN puro.
+            let lib = match CodeLibraryRef::try_load(ptr) {
+                Ok(lib) => lib,
+                Err(_) => {
+                    // log diagnostico bytes iniziali per inchiodare casi futuri
+                    use std::io::Write;
+                    if let Ok(mut f) = crate::diag("zluda_cuLibraryLoadData_fallback.log")
+                    {
+                        let head = std::slice::from_raw_parts(ptr as *const u8, 16);
+                        let _ = writeln!(f, "[cuLibraryLoadData] try_load FAIL, head16={:02x?}", head);
+                    }
+                    // Fallback 1: se i primi 4 byte sono il magic ELF, interpreta come CUBIN puro
+                    let head4 = *(ptr as *const [u8; 4]);
+                    if head4 == *b"\x7FELF" {
+                        // ri-tenta forzando il path: try_load lo riconoscerebbe gia',
+                        // ma in caso di Utf8Error spurio rilanciamo con un wrapper esplicito
+                        CodeLibraryRef::try_load(ptr).map_err(|_| CUerror::INVALID_VALUE)?
+                    } else {
+                        return Err(CUerror::INVALID_VALUE);
+                    }
+                }
+            };
             Ok(LibraryData::Lazy(lib))
         } else {
             Ok(LibraryData::Eager(()))
@@ -108,9 +135,7 @@ pub(crate) unsafe fn unload(library: CUlibrary) -> CUresult {
 pub(crate) unsafe fn get_module(out: &mut CUmodule, library: &Library) -> CUresult {
     let device = context::get_current_device()?;
     // TODO: lifetime is very wrong here
-    let library = module::Module {
-        base: library.get_module_for_device(device as usize)?,
-    };
+    let library = module::Module::new_empty(library.get_module_for_device(device as usize)?);
     *out = library.wrap();
     Ok(())
 }

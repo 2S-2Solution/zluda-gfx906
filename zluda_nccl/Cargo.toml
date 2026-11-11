@@ -1,0 +1,24 @@
+[package]
+name = "zluda_nccl"
+version = "0.0.0"
+authors = ["2 Solution <info@2solution.it>"]
+edition = "2021"
+
+# VEGA-PATCH 2026-06-30 T15:50 — Stub graceful per LoadLibrary feature-detect
+# nccl64_2.dll: app reali (PyTorch DDP, TensorFlow MirroredStrategy, JAX pmap,
+# DeepSpeed, Megatron) chiamano LoadLibraryW("nccl64_2.dll") in early-init
+# anche su 1-GPU per probare multi-GPU collectives. Senza la DLL il path
+# fallback è single-GPU silenzioso, MA alcuni init code path fanno
+# GetProcAddress("ncclGetVersion") e crash su NULL. Stub graceful = pass.
+# Ritorni: ncclGetVersion, ncclGetUniqueId, ncclCommCount, ncclCommUserRank,
+# ncclCommCuDevice → SUCCESS (0) con valori plausibili.
+# Ops collective reali (CommInitRank, AllReduce, Broadcast, ...) → unhandled
+# error so caller può fallback CPU/skip.
+
+[lib]
+crate-type = ["cdylib"]
+name = "nccl"
+
+[package.metadata.zluda]
+linux_symlinks = ["libnccl.so", "libnccl.so.2"]
+windows_paths = ["nccl64_2.dll", "nccl.dll"]

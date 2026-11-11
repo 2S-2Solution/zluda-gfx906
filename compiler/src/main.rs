@@ -176,7 +176,7 @@ mod hip {
 
         pub fn load() -> Result<Self, CompilerError> {
             #[cfg(windows)]
-            let lib_name = "amdhip64_6.dll\0";
+            let lib_name = "amdhip64_7_shim.dll\0";
             #[cfg(unix)]
             let lib_name = "libamdhip64.so.6\0";
             let library = unsafe { libloading::Library::new(lib_name)? };

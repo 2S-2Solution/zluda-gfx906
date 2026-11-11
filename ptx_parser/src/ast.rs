@@ -57,6 +57,29 @@ ptx_parser_macros::generate_instruction_type!(
                 src2: T,
             }
         },
+        // VEGA 3 lug: aritmetica estesa con riporto (extended-precision carry chain).
+        // Copre add.cc/addc/addc.cc/sub.cc/subc/subc.cc — usate da foreach (indirizzi 64-bit)
+        // e dal slow-path trig di exp. Il flag CC.CF e' implicito (threaded in emit), non un operando.
+        AddCarry {
+            type: { Type::Scalar(data.type_) },
+            data: AddCarryDetails,
+            arguments<T>: {
+                dst: T,
+                src1: T,
+                src2: T,
+            }
+        },
+        // mad.lo.cc/mad.hi.cc/madc.lo.cc/madc.hi.cc/madc.hi (mul-add con riporto).
+        MadCarry {
+            type: { Type::Scalar(data.type_) },
+            data: MadCarryDetails,
+            arguments<T>: {
+                dst: T,
+                src1: T,
+                src2: T,
+                src3: T,
+            }
+        },
         And {
             data: ScalarType,
             type: { Type::Scalar(data.clone()) },
@@ -159,6 +182,21 @@ ptx_parser_macros::generate_instruction_type!(
                 },
             }
         },
+        // VEGA 3 lug: scalar video instruction vshr (solo forma u32.u32.u32.clamp.add,
+        // usata da cub radix sort → torch.sort/argsort/topk/randperm). d = (a >> clamp(b,32)) + c.
+        Vshr {
+            type: Type::Scalar(data.clone()),
+            data: ScalarType,
+            arguments<T>: {
+                dst: T,
+                src1: T,
+                src2: {
+                    repr: T,
+                    type: Type::Scalar(ScalarType::U32)
+                },
+                src3: T,
+            }
+        },
         Bra {
             type: !,
             arguments<T::Ident>: {
@@ -183,6 +221,19 @@ ptx_parser_macros::generate_instruction_type!(
         Clz {
             type: Type::Scalar(data.clone()),
             data: ScalarType,
+            arguments<T>: {
+                dst: {
+                    repr: T,
+                    type: Type::Scalar(ScalarType::U32)
+                },
+                src: T
+            }
+        },
+        // [VEGA-PATCH bfind, 17 ott 2026] bfind{.shiftamt}.{u32,u64,s32,s64}.
+        // Il risultato e' sempre u32, come per clz.
+        Bfind {
+            type: Type::Scalar(data.type_.clone()),
+            data: BfindDetails,
             arguments<T>: {
                 dst: {
                     repr: T,
@@ -682,6 +733,9 @@ ptx_parser_macros::generate_instruction_type!(
             }
         },
         Trap { },
+        // VEGA 3 lug: PTX `exit` (termina il thread). Usata da cub radix sort (SingleTile) →
+        // torch.randperm. Terminatore di blocco, lowering = ret void.
+        Exit { },
         Xor {
             type: Type::Scalar(data.clone()),
             data: ScalarType,
@@ -1756,6 +1810,23 @@ pub enum MulIntControl {
     Wide,
 }
 
+// VEGA 3 lug: dettagli aritmetica con riporto (extended-precision carry).
+#[derive(Copy, Clone)]
+pub struct AddCarryDetails {
+    pub type_: ScalarType,
+    pub subtract: bool,  // false=add.cc/addc, true=sub.cc/subc
+    pub carry_in: bool,  // legge CC.CF (prefisso 'c': addc/subc)
+    pub carry_out: bool, // scrive CC.CF (suffisso '.cc')
+}
+
+#[derive(Copy, Clone)]
+pub struct MadCarryDetails {
+    pub type_: ScalarType,
+    pub hi: bool,        // false=.lo, true=.hi
+    pub carry_in: bool,  // 'madc'
+    pub carry_out: bool, // '.cc'
+}
+
 #[derive(Copy, Clone)]
 pub struct Mul24Details {
     pub type_: ScalarType,
@@ -2277,6 +2348,14 @@ pub struct CvtaDetails {
 pub enum CvtaDirection {
     GenericToExplicit,
     ExplicitToGeneric,
+}
+
+#[derive(Copy, Clone, PartialEq, Eq)]
+pub struct BfindDetails {
+    pub type_: ScalarType,
+    /// `.shiftamt`: invece della posizione del bit piu' significativo (non di
+    /// segno), restituisce di quanto spostarlo a sinistra per portarlo in cima.
+    pub shift_amount: bool,
 }
 
 #[derive(Copy, Clone, PartialEq, Eq)]

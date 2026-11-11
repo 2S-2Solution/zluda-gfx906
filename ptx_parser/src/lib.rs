@@ -386,6 +386,21 @@ fn lex_with_span_unchecked<'input>(
     (result, errors)
 }
 
+/// [VEGA-PATCH ordine, 17 ott 2026] Alcuni PTX di PyTorch (Distributions.cu) scrivono
+/// il tipo PRIMA di `.ftz` (`lg2.approx.f32.ftz`). ptxas accetta i modificatori in
+/// qualunque ordine; questo parser no, e l'intero modulo diventava inanalizzabile,
+/// cioe' VUOTO sotto ZLUDA (Gamma, Beta, Dirichlet: err 500). Regole gemelle con
+/// l'ordine invertito non si possono aggiungere: il generatore del parser non sa
+/// scegliere fra pattern che iniziano uguali. Si riporta quindi il testo all'ordine
+/// canonico prima di analizzarlo: la semantica e' identica.
+pub fn va_normalizzato(testo: &str) -> bool {
+    testo.contains(".approx.f32.ftz")
+}
+
+pub fn normalizza(testo: &str) -> String {
+    testo.replace(".approx.f32.ftz", ".approx.ftz.f32")
+}
+
 pub fn parse_module_checked<'input>(
     text: &'input str,
 ) -> Result<ast::Module<'input>, Vec<PtxError<'input>>> {
@@ -1610,6 +1625,37 @@ fn call<'a, 'input>(
     Ok(ast::Instruction::Call { data, arguments })
 }
 
+// VEGA 3 lug: parser custom per la scalar video instruction `vshr.u32.u32.u32.clamp.add d,a,b,c`
+// (unica forma emessa da cub radix sort → torch.sort/argsort/topk/randperm). Semantica PTX:
+// d = (a >> min(b,32)) + c, u32 logico. Il macro derive_parser vuole i modificatori-enum prima del
+// tipo, ma qui e' tipo-poi-enum, quindi parser a mano. Matcha SOLO questa forma: ogni altra fa
+// fallire il parser (statement non riconosciuto) invece di dare risultati sbagliati (Regola 3).
+fn vshr<'a, 'input>(
+    stream: &mut PtxParser<'a, 'input>,
+) -> PResult<ast::Instruction<ParsedOperandStr<'input>>> {
+    Token::DotU32.parse_next(stream)?; // dtype
+    Token::DotU32.parse_next(stream)?; // atype (valore da shiftare)
+    Token::DotU32.parse_next(stream)?; // btype (ampiezza shift)
+    Token::DotClamp.parse_next(stream)?;
+    Token::DotAdd.parse_next(stream)?;
+    let d = ParsedOperand::<&'input str>::parse.parse_next(stream)?;
+    Token::Comma.parse_next(stream)?;
+    let a = ParsedOperand::<&'input str>::parse.parse_next(stream)?;
+    Token::Comma.parse_next(stream)?;
+    let b = ParsedOperand::<&'input str>::parse.parse_next(stream)?;
+    Token::Comma.parse_next(stream)?;
+    let c = ParsedOperand::<&'input str>::parse.parse_next(stream)?;
+    Ok(ast::Instruction::Vshr {
+        data: ScalarType::U32,
+        arguments: VshrArgs {
+            dst: d,
+            src1: a,
+            src2: b,
+            src3: c,
+        },
+    })
+}
+
 fn empty_call<'input>(
     uniform: bool,
     name: &'input str,
@@ -2141,6 +2187,51 @@ derive_parser!(
                           .s16, .s64,
                           .u16x2, .s16x2 };
     ScalarType =        { .s32 };
+
+    // VEGA 3 lug: extended-precision add/sub con riporto (CC.CF implicito).
+    // https://docs.nvidia.com/cuda/parallel-thread-execution/#extended-precision-integer-arithmetic-instructions
+    add.cc.type     d, a, b => {
+        ast::Instruction::AddCarry {
+            data: ast::AddCarryDetails { type_, subtract: false, carry_in: false, carry_out: true },
+            arguments: AddCarryArgs { dst: d, src1: a, src2: b }
+        }
+    }
+    .type: ScalarType = { .u32, .s32 };
+    addc.cc.type    d, a, b => {
+        ast::Instruction::AddCarry {
+            data: ast::AddCarryDetails { type_, subtract: false, carry_in: true, carry_out: true },
+            arguments: AddCarryArgs { dst: d, src1: a, src2: b }
+        }
+    }
+    .type: ScalarType = { .u32, .s32 };
+    addc.type       d, a, b => {
+        ast::Instruction::AddCarry {
+            data: ast::AddCarryDetails { type_, subtract: false, carry_in: true, carry_out: false },
+            arguments: AddCarryArgs { dst: d, src1: a, src2: b }
+        }
+    }
+    .type: ScalarType = { .u32, .s32 };
+    sub.cc.type     d, a, b => {
+        ast::Instruction::AddCarry {
+            data: ast::AddCarryDetails { type_, subtract: true, carry_in: false, carry_out: true },
+            arguments: AddCarryArgs { dst: d, src1: a, src2: b }
+        }
+    }
+    .type: ScalarType = { .u32, .s32 };
+    subc.cc.type    d, a, b => {
+        ast::Instruction::AddCarry {
+            data: ast::AddCarryDetails { type_, subtract: true, carry_in: true, carry_out: true },
+            arguments: AddCarryArgs { dst: d, src1: a, src2: b }
+        }
+    }
+    .type: ScalarType = { .u32, .s32 };
+    subc.type       d, a, b => {
+        ast::Instruction::AddCarry {
+            data: ast::AddCarryDetails { type_, subtract: true, carry_in: true, carry_out: false },
+            arguments: AddCarryArgs { dst: d, src1: a, src2: b }
+        }
+    }
+    .type: ScalarType = { .u32, .s32 };
 
     // https://docs.nvidia.com/cuda/parallel-thread-execution/#floating-point-instructions-add
     add{.rnd}{.ftz}{.sat}.f32  d, a, b => {
@@ -2728,6 +2819,39 @@ derive_parser!(
     }
     RawMulIntControl =  { .hi };
     ScalarType =        { .s32 };
+
+    // VEGA 3 lug: mul-add con riporto (extended-precision). mad.lo.cc/mad.hi.cc/
+    // madc.lo.cc/madc.hi.cc/madc.lo/madc.hi — 6 forme in 3 regole via .mode.
+    mad.mode.cc.type   d, a, b, c => {
+        ast::Instruction::MadCarry {
+            data: ast::MadCarryDetails {
+                type_, hi: matches!(mode, RawMulIntControl::Hi), carry_in: false, carry_out: true
+            },
+            arguments: MadCarryArgs { dst: d, src1: a, src2: b, src3: c }
+        }
+    }
+    .mode: RawMulIntControl = { .hi, .lo };
+    .type: ScalarType = { .u32, .s32 };
+    madc.mode.cc.type  d, a, b, c => {
+        ast::Instruction::MadCarry {
+            data: ast::MadCarryDetails {
+                type_, hi: matches!(mode, RawMulIntControl::Hi), carry_in: true, carry_out: true
+            },
+            arguments: MadCarryArgs { dst: d, src1: a, src2: b, src3: c }
+        }
+    }
+    .mode: RawMulIntControl = { .hi, .lo };
+    .type: ScalarType = { .u32, .s32 };
+    madc.mode.type     d, a, b, c => {
+        ast::Instruction::MadCarry {
+            data: ast::MadCarryDetails {
+                type_, hi: matches!(mode, RawMulIntControl::Hi), carry_in: true, carry_out: false
+            },
+            arguments: MadCarryArgs { dst: d, src1: a, src2: b, src3: c }
+        }
+    }
+    .mode: RawMulIntControl = { .hi, .lo };
+    .type: ScalarType = { .u32, .s32 };
 
     mad{.ftz}{.sat}.f32      d, a, b, c => {
         ast::Instruction::Mad {
@@ -3656,6 +3780,17 @@ derive_parser!(
     }
     .type: ScalarType = { .b32, .b64 };
 
+    // https://docs.nvidia.com/cuda/parallel-thread-execution/index.html#integer-arithmetic-instructions-bfind
+    // [VEGA-PATCH bfind, 17 ott 2026] mancava del tutto: un solo bfind rendeva
+    // inanalizzabile l'intero modulo (Embedding.cu di PyTorch).
+    bfind{.shiftamt}.type  d, a => {
+        ast::Instruction::Bfind {
+            data: ast::BfindDetails { type_, shift_amount: shiftamt },
+            arguments: BfindArgs { dst: d, src: a, },
+        }
+    }
+    .type: ScalarType = { .u32, .u64, .s32, .s64 };
+
     // https://docs.nvidia.com/cuda/parallel-thread-execution/index.html#integer-arithmetic-instructions-brev
     brev.type  d, a => {
         ast::Instruction::Brev {
@@ -3864,8 +3999,20 @@ derive_parser!(
     .dir: ShiftDirection = { .l, .r };
     .mode: FunnelShiftMode = { .clamp, .wrap };
 
+    // https://docs.nvidia.com/cuda/parallel-thread-execution/#scalar-video-instructions
+    // VEGA 3 lug: scalar video vshr (cub radix sort → torch.sort/argsort/topk/randperm). Il macro
+    // derive_parser vuole i modificatori-enum PRIMA del tipo (vedi shf/atom), ma la forma reale e'
+    // tipo-poi-enum (.u32.u32.u32.clamp.add) → parser CUSTOM via escape `<=` (come bra/call).
+    vshr <= { vshr(stream) }
+
     trap => {
         Instruction::Trap {}
+    }
+
+    // https://docs.nvidia.com/cuda/parallel-thread-execution/#control-flow-instructions-exit
+    // VEGA 3 lug: `exit` termina il thread (cub radix sort SingleTile → torch.randperm).
+    exit => {
+        Instruction::Exit {}
     }
 
     // https://docs.nvidia.com/cuda/parallel-thread-execution/#integer-arithmetic-instructions-dp4a

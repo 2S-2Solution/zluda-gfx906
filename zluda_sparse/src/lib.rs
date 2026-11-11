@@ -35,6 +35,24 @@ cuda_macros::cusparse_function_declarations!(
             cusparseGetMatIndexBase,
             cusparseGetMatDiagType,
             cusparseGetMatFillMode,
-            cusparseGetMatType
+            cusparseGetMatType,
+            // VEGA-PATCH 2026-06-30 sprint-rust-final-T15:42 cusparse stub graceful
+            // per app reali (PyTorch capability probe, Blender splash, AutoCAD init).
+            // Senza questi torch.cuda.is_available() falliva durante import perche'
+            // PyTorch fa probing carica cusparse all'avvio. Vedi impl.rs commenti dettagli.
+            cusparseCreate,
+            cusparseDestroy,
+            cusparseGetVersion,
+            cusparseGetProperty,
+            cusparseSetStream,
+            cusparseGetStream,
+            cusparseSetPointerMode,
+            cusparseGetPointerMode,
+            cusparseCreateMatDescr,
+            cusparseDestroyMatDescr,
+            cusparseSetMatType,
+            cusparseSetMatFillMode,
+            cusparseSetMatDiagType,
+            cusparseSetMatIndexBase
         ]
 );

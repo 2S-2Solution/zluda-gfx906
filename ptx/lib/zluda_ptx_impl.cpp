@@ -23,11 +23,10 @@ then cd to the directory with this file and run this simple command:
     zluda_ptx_impl.cpp \
     -nogpulib \
     -O3 \
-    -mno-wavefrontsize64 \
     -o zluda_ptx_impl.bc \
     -emit-llvm \
     -c \
-    --offload-device-only --offload-arch=gfx1030 && \
+    --offload-device-only --offload-arch=gfx906 && \
 ../../ext/llvm-project/build/bin/llvm-dis zluda_ptx_impl.bc -o - \
     | sed '/@llvm.used/d' \
     | sed '/wchar_size/d' \
@@ -35,10 +34,24 @@ then cd to the directory with this file and run this simple command:
     | sed '/__hip_cuid/d' \
     | sed 's/optnone//g' \
     | sed 's/define hidden/define linkonce_odr/g' \
-    | sed 's/\"target-cpu\"=\"gfx1030\"//g' \
+    | sed 's/\"target-cpu\"=\"gfx906\"//g' \
     | sed -E 's/\"target-features\"=\"[^\"]+\"//g'| \
 ../../ext/llvm-project/build/bin/llvm-as - -o  zluda_ptx_impl.bc && \
 ../../ext/llvm-project/build/bin/llvm-dis zluda_ptx_impl.bc
+
+RISOLTO FINO ALLA FINE (Vega, 2026-07-02) — target gfx906 NON gfx1030, e NIENTE
+-mno-wavefrontsize64. Motivo: la reduction wave64 (sum/mean dim=None di PyTorch)
+dava garbage. Root cause: compilando per gfx1030 wave32, clang a -O3 folda via
+__builtin_amdgcn_mbcnt_hi dentro __lane_id() (su wave32 le lane 32-63 non
+esistono), lasciando solo mbcnt.lo. Sul codegen finale gfx906 wave64 quel
+__lane_id() ritorna 32 per TUTTE le hw-lane 32-63 -> il confinamento 32-subsection
+di SHFL_SYNC_IMPL collassa (self = self_abs - twarp_base = 0 per le lane alte) e le
+warp dispari non riducono. Compilando per gfx906 wave64 mbcnt.hi sopravvive,
+__lane_id() ritorna 0-63 veri, il confinamento funziona. Il sed strippa comunque
+target-cpu/features -> IR target-neutral, ZLUDA rimette gfx906 al link (le funzioni
+elementwise senza cross-lane sono insensibili alla wave size). Verificato empirico:
+kernel HIP che chiama __zluda_ptx_impl_shfl_sync_down_b32 reale del .bc, reduction
+64-lane -> lane0=528 lane32=1552 CORRETTI (asm-only pipeline, no hang).
 */
 
 #include <cstddef>
@@ -47,7 +60,6 @@ then cd to the directory with this file and run this simple command:
 #include <cmath>
 #include <hip/hip_runtime.h>
 #include <hip/amd_detail/amd_device_functions.h>
-#include <hip/hip_fp8.h>
 
 #define SHARED_SPACE __attribute__((address_space(3)))
 #define CONSTANT_SPACE __attribute__((address_space(4)))
@@ -75,9 +87,20 @@ extern "C"
 {
     extern "C" __attribute__((constant)) CONSTANT_SPACE uint32_t __oclc_ISA_version __device__;
 
+    // [VEGA-FIX WAVE64-WARP 31 lug 2026] activemask confinato al torch-warp da 32 lane.
+    // Era `read_exec_lo()`, cioe' SEMPRE i 32 bit bassi della wavefront: per il
+    // torch-warp alto [32-63] restituiva la maschera del warp basso — quello
+    // sbagliato. Le altre primitive (laneid, lanemask_*, ballot, vote) erano gia'
+    // state confinate il 4 lug; questa era rimasta indietro.
+    // Conseguenza misurata: il decoupled look-back di cub (ScanTileState) sceglieva
+    // tile predecessori sbagliati, e `unique` restituiva un conteggio negativo
+    // (-319 su 64 elementi). Colpiti unique / randperm / nonzero / masked_select /
+    // topk / scatter_add / cumsum su n grande.
+    // Stesso calcolo di vote_sync_all_pred: si prende la propria meta' di exec.
     uint32_t FUNC(activemask)()
     {
-        return __builtin_amdgcn_read_exec_lo();
+        uint32_t base = (uint32_t)__lane_id() & 0x20U;
+        return (uint32_t)(__builtin_amdgcn_read_exec() >> base);
     }
 
     size_t __ockl_get_local_id(uint32_t) __device__;
@@ -86,10 +109,20 @@ extern "C"
         return (uint32_t)__ockl_get_local_id(member);
     }
 
-    size_t __ockl_get_local_size(uint32_t) __device__;
+    // [VEGA-FIX 2 lug 2026 (Fable 5)] ROOT CAUSE reduction rotta: __ockl_get_local_size /
+    // __ockl_get_num_groups ritornano 0 su ZLUDA gfx906 (l'implicit-kernarg che gli serve
+    // non e' impostato dal launch). => blockDim=gridDim=0 => ogni loop di block_reduce gira
+    // 0 volte => sopravvive solo il thread 0 (coverage=ceil(n/nthreads)). Bisect PTX confermato:
+    // %ntid.x=0, %nctaid.x=0, mentre %tid.x/%ctaid.x (register hw) OK.
+    // FIX: leggo blockDim/gridDim DIRETTAMENTE dal dispatch packet AQL via dispatch_ptr,
+    // self-contained (no __ockl). Layout hsa_kernel_dispatch_packet_t:
+    //   off 4/6/8  = uint16 workgroup_size_x/y/z ; off 12/16/20 = uint32 grid_size_x/y/z (TOT thread).
+    //   gridDim(CUDA) = ceil(grid_size / workgroup_size).
     uint32_t FUNC(sreg_ntid)(uint8_t member)
     {
-        return (uint32_t)__ockl_get_local_size(member);
+        const CONSTANT_SPACE uint8_t *dp = (const CONSTANT_SPACE uint8_t *)__builtin_amdgcn_dispatch_ptr();
+        const CONSTANT_SPACE uint16_t *wgs = (const CONSTANT_SPACE uint16_t *)(dp + 4);
+        return (uint32_t)wgs[member & 3u];
     }
 
     size_t __ockl_get_group_id(uint32_t) __device__;
@@ -98,27 +131,61 @@ extern "C"
         return (uint32_t)__ockl_get_group_id(member);
     }
 
-    size_t __ockl_get_num_groups(uint32_t) __device__;
     uint32_t FUNC(sreg_nctaid)(uint8_t member)
     {
-        return (uint32_t)__ockl_get_num_groups(member);
+        const CONSTANT_SPACE uint8_t *dp = (const CONSTANT_SPACE uint8_t *)__builtin_amdgcn_dispatch_ptr();
+        const CONSTANT_SPACE uint16_t *wgs = (const CONSTANT_SPACE uint16_t *)(dp + 4);
+        const CONSTANT_SPACE uint32_t *gs = (const CONSTANT_SPACE uint32_t *)(dp + 12);
+        uint32_t w = (uint32_t)wgs[member & 3u];
+        uint32_t g = gs[member & 3u];
+        return w ? (g + w - 1u) / w : 0u;
     }
 
+    // [VEGA-FIX WAVE64-WARP 4 lug 2026] Confinamento subsection-32 coerente con SHFL_SYNC_IMPL.
+    // CUDA compila con warpSize=32: %laneid e %lanemask_* sono definiti su un warp da 32 lane.
+    // Su gfx906 wave64 la wavefront fisica ha 64 lane = DUE torch-warp logici [0-31] e [32-63].
+    // __lane_id() ritorna 0-63 (assoluto); la lane LOGICA nel torch-warp e' (laneid & 0x1f).
+    // Tutte le primitive di warp (laneid, lanemask_*, ballot, vote) DEVONO vivere in questo
+    // spazio 0-31 — come gia' fa shfl (self_abs & 0x20) — altrimenti il look-back cooperativo
+    // di cub (radix sort Onesweep: ballot + lanemask + shfl insieme) sceglie tile predecessori
+    // sbagliati -> sort/argsort/topk n>=2000 silenziosamente errati.
+    // Bug precedenti chiusi da qui: (a) laneid 0-63 usato come indice a 32-lane; (b) lanemask
+    // con shift u32 per lane>=32 = UB (era il crash/wedge di topk %lanemask_le); (c) %lanemask_le/
+    // gt/eq non implementati -> modulo Onesweep UnknownSymbol -> kernel non gira -> buffer garbage.
+    // Calcolo in 64-bit poi cast u32 per evitare ogni shift >= 32.
     uint32_t FUNC(sreg_laneid)()
     {
-        return __lane_id();
+        return __lane_id() & 0x1fU;
     }
 
     uint32_t FUNC(sreg_lanemask_lt)()
     {
-        uint32_t lane_idx = FUNC_CALL(sreg_laneid)();
-        return (1U << lane_idx) - 1U;
+        uint32_t lane = __lane_id() & 0x1fU;
+        return (uint32_t)((((uint64_t)1U) << lane) - 1U);
+    }
+
+    uint32_t FUNC(sreg_lanemask_le)()
+    {
+        uint32_t lane = __lane_id() & 0x1fU;
+        return (uint32_t)((((uint64_t)1U) << (lane + 1U)) - 1U);
     }
 
     uint32_t FUNC(sreg_lanemask_ge)()
     {
-        uint32_t lane_idx = FUNC_CALL(sreg_laneid)();
-        return (~0U) << lane_idx;
+        uint32_t lane = __lane_id() & 0x1fU;
+        return (uint32_t)(~((((uint64_t)1U) << lane) - 1U));
+    }
+
+    uint32_t FUNC(sreg_lanemask_gt)()
+    {
+        uint32_t lane = __lane_id() & 0x1fU;
+        return (uint32_t)(~((((uint64_t)1U) << (lane + 1U)) - 1U));
+    }
+
+    uint32_t FUNC(sreg_lanemask_eq)()
+    {
+        uint32_t lane = __lane_id() & 0x1fU;
+        return (uint32_t)(((uint64_t)1U) << lane);
     }
 
     uint32_t __ockl_bfe_u32(uint32_t, uint32_t, uint32_t) __device__;
@@ -243,22 +310,42 @@ extern "C"
 
     // shfl.sync opts consists of two values, the warp end ID and the subsection mask.
     //
+    // [VEGA-FIX F.1 22 giu 2026 T15:00] Wave64 patch — bit-width mask expanded from 5-bit (0b11111=31)
+    // to 6-bit (0b111111=63) per supportare lane id 0-63 di wave64 gfx906.
+    // Root cause BUG F.1: PyTorch ATen reduction last-axis tramite __shfl_*_sync produceva off-by-half
+    // (14000%+ rel diff) perchè il subsection era clippato a 5-bit (max lane 31) ignorando lanes 32-63.
+    // CUDA __shfl_sync è documentato per width 0-32, ma su HIP wave64 il subsection deve estendersi a 0-64.
+    // Vedi sediment ZLUDA_BUG_TRACKER cat F.1 + REGOLE_TASSATIVE.md regola 17.
+    //
     // The current warp is partitioned into some number of subsections with a width of w. The
-    // subsection mask is 32 - w, and indicates which bits of the lane id are part of the subsection
-    // address. For example, if each subsection is 8 lanes wide, the subsection mask will be 24 –
-    // 11000 in binary. This indicates that the two most significant bits in the 5-bit lane ID are
-    // the subsection address. For example, for a lane ID 13 (0b01101) the address of the beginning
-    // of the subsection is 0b01000 (8).
+    // subsection mask is 32 - w (or 64 - w on wave64), and indicates which bits of the lane id are
+    // part of the subsection address. For example, if each subsection is 8 lanes wide on wave64,
+    // the subsection mask will be 56 – 111000 in binary. This indicates that the three most
+    // significant bits in the 6-bit lane ID are the subsection address.
     //
     // The warp end ID is the max lane ID for a specific mode. For the CUDA __shfl_sync
-    // intrinsics, it is always 31 for idx, bfly, and down, and 0 for up. This is used for the
-    // bounds check.
+    // intrinsics, it is always 31 (wave32) or 63 (wave64) for idx, bfly, and down, and 0 for up.
+    // This is used for the bounds check.
+// [VEGA-FIX WAVE64-REDUCE 2 lug 2026 (Fable 5)] Root cause bug reduction dim=None.
+// torch wheel e' CUDA-compiled con warpSize=32: le shfl.sync codificano opts a
+// 5-bit (warp_end=31 per down/bfly/idx, 0 per up; section_mask 0-31). Su gfx906
+// wave64 la wavefront fisica ha 64 lane. Col vecchio codice le lane 32-63 avevano
+// subsection_end=31 -> sempre out-of-bounds -> non partecipavano allo shuffle ->
+// la loro META' di dati era persa. torch legge lane 0 (torch-warp 0) e lane 32
+// (torch-warp 1) via shared mem, ma la lane 32 non aveva ridotto nulla -> sum/mean
+// dimezzate/garbage (GPU 10.1 vs CPU 13.5 su vettore da 5).
+// FIX: se opts e' wave32-encoded (section_mask<=31 && warp_end<=31), confino lo
+// shuffle al torch-warp di appartenenza [0-31] o [32-63] (base = self_abs & 0x20),
+// cosi' ogni torch-warp riduce indipendente e torch ricombina i 2 leader via LDS.
+// La patch F.1 5->6 bit era un no-op (torch manda comunque 5-bit). Vero fix = questo.
 #define SHFL_SYNC_IMPL(mode, calculate_index, CMP)                                                                                              \
     ShflSyncResult FUNC(shfl_sync_##mode##_b32_pred)(uint32_t input, int32_t delta, uint32_t opts, uint32_t membermask __attribute__((unused))) \
     {                                                                                                                                           \
-        int32_t section_mask = (opts >> 8) & 0b11111;                                                                                           \
-        int32_t warp_end = opts & 0b11111;                                                                                                      \
-        int32_t self = (int32_t)__lane_id();                                                                                                    \
+        int32_t section_mask = (opts >> 8) & 0b111111;                                                                                          \
+        int32_t warp_end = opts & 0b111111;                                                                                                     \
+        int32_t self_abs = (int32_t)__lane_id();                                                                                                \
+        int32_t twarp_base = ((section_mask <= 0x1f) && (warp_end <= 0x1f)) ? (self_abs & 0x20) : 0;                                            \
+        int32_t self = self_abs - twarp_base;                                                                                                   \
         int32_t subsection = section_mask & self;                                                                                               \
         int32_t subsection_end = subsection | (~section_mask & warp_end);                                                                       \
         int32_t idx = calculate_index;                                                                                                          \
@@ -267,7 +354,8 @@ extern "C"
         {                                                                                                                                       \
             idx = self;                                                                                                                         \
         }                                                                                                                                       \
-        int32_t output = __builtin_amdgcn_ds_bpermute(idx << 2, (int32_t)input);                                                                \
+        int32_t abs_idx = twarp_base + (idx & 0x1f);                                                                                            \
+        int32_t output = __builtin_amdgcn_ds_bpermute(abs_idx << 2, (int32_t)input);                                                            \
         return {(uint32_t)output, uint32_t(!out_of_bounds)};                                                                                    \
     }                                                                                                                                           \
                                                                                                                                                 \
@@ -284,6 +372,101 @@ extern "C"
     SHFL_SYNC_IMPL(down, self + delta, >);
     SHFL_SYNC_IMPL(bfly, self ^ delta, >);
     SHFL_SYNC_IMPL(idx, (delta & ~section_mask) | subsection, >);
+
+    // ============================================================================
+    // VEGA TASK D 30 giu 2026 T07:55 — LDS scratchpad shuffle (opt-in)
+    // ============================================================================
+    //
+    // Implementazione alternativa che NON usa __builtin_amdgcn_ds_bpermute.
+    // Pattern: ogni thread del workgroup scrive il proprio input in LDS shared
+    // memory all'offset corrispondente al proprio lane id, esegue __syncthreads
+    // (s_barrier + s_waitcnt lgkmcnt(0)), poi rilegge dall'offset target.
+    //
+    // Costo: ~3-5x latenza rispetto a ds_bpermute (2 LDS op + 1 barriera vs
+    // 1 LDS permute hw). Vantaggio: la barriera __syncthreads e' un safepoint
+    // che il driver Windows WDDM tratta come progresso evitando TDR durante
+    // sequenze butterfly log2(64) consecutive in backward LN2.
+    //
+    // IMPORTANTE: questo helper assume blockDim.x % 64 == 0 (multipli di una
+    // wavefront wave64). Il caller PyTorch ATen reduction respecta sempre questa
+    // condizione. Usiamo HIP_DYNAMIC_SHARED per non allocare LDS staticamente
+    // (i kernel chiamanti gestiscono gia' lo shared memory pool).
+    //
+    // Riservazione LDS: 64 * sizeof(uint32_t) = 256 byte per wavefront.
+    // Indicizziamo nello scratchpad con offset wave_id * 64 + lane_id.
+    //
+    // [VEGA TASK D worker 2/5 fix 30 giu T08:10] Switch da `extern __shared__`
+    // (dynamic shared, richiede 3rd arg in <<<grid,block,smem>>> che PyTorch
+    // ATen NON imposta — alias silenzioso con dynamic smem altrui) a
+    // statically-sized `__attribute__((shared))`. 4 KB = 16 wave × 64 lane ×
+    // 4 byte, trascurabile su gfx906 64 KB LDS/CU. Garantisce isolation totale
+    // dal pool dynamic shared.
+    //
+    // Vedi pass rewrite_shfl_to_lds.rs + feature wave64_lds_scratchpad in Cargo.toml.
+
+    // Max 16 wave per block (1024 thread max ÷ 64 wave64 = 16 wave) × 64 slot
+    // = 1024 uint32 = 4 KB LDS statically reserved per block.
+    static constexpr int SHFL_LDS_MAX_WAVES_PER_BLOCK = 16;
+    static constexpr int SHFL_LDS_WAVE_LANES = 64;
+    static constexpr int SHFL_LDS_TOTAL_SLOTS =
+        SHFL_LDS_MAX_WAVES_PER_BLOCK * SHFL_LDS_WAVE_LANES;
+
+    __attribute__((shared)) uint32_t
+        __zluda_shfl_lds_scratch[SHFL_LDS_TOTAL_SLOTS];
+
+    static __device__ __forceinline__ uint32_t shfl_lds_core(uint32_t input, int32_t target_lane)
+    {
+        const uint32_t lane = __lane_id();                          // 0..63
+        // wave_id locale al block: flat thread id (3D) >> 6 (=÷64).
+        // workitem_id_x da solo non basta per kernel 2D/3D PyTorch.
+        const uint32_t flat_tid =
+            (uint32_t)__builtin_amdgcn_workitem_id_x()
+            + (uint32_t)__builtin_amdgcn_workitem_id_y()
+                * (uint32_t)__builtin_amdgcn_workgroup_size_x()
+            + (uint32_t)__builtin_amdgcn_workitem_id_z()
+                * (uint32_t)__builtin_amdgcn_workgroup_size_x()
+                * (uint32_t)__builtin_amdgcn_workgroup_size_y();
+        const uint32_t wave_id = flat_tid >> 6;
+        uint32_t* slot = __zluda_shfl_lds_scratch + (wave_id << 6); // 64 slot per wave
+        slot[lane] = input;
+        __builtin_amdgcn_s_waitcnt(0);                              // attendi LDS write
+        __builtin_amdgcn_s_barrier();                               // sync workgroup
+        uint32_t result = slot[target_lane & 0x3f];                 // mask 6-bit wave64
+        __builtin_amdgcn_s_waitcnt(0);                              // attendi LDS read
+        __builtin_amdgcn_s_barrier();                               // chiudi finestra lettura
+        return result;
+    }
+
+#define SHFL_LDS_IMPL(mode, calculate_index, CMP)                                                                                              \
+    ShflSyncResult FUNC(shfl_lds_##mode##_b32_pred)(uint32_t input, int32_t delta, uint32_t opts, uint32_t membermask __attribute__((unused))) \
+    {                                                                                                                                          \
+        int32_t section_mask = (opts >> 8) & 0b111111;                                                                                         \
+        int32_t warp_end = opts & 0b111111;                                                                                                    \
+        int32_t self = (int32_t)__lane_id();                                                                                                   \
+        int32_t subsection = section_mask & self;                                                                                              \
+        int32_t subsection_end = subsection | (~section_mask & warp_end);                                                                      \
+        int32_t idx = calculate_index;                                                                                                         \
+        bool out_of_bounds = idx CMP subsection_end;                                                                                           \
+        if (out_of_bounds)                                                                                                                     \
+        {                                                                                                                                      \
+            idx = self;                                                                                                                        \
+        }                                                                                                                                      \
+        uint32_t output = shfl_lds_core(input, idx);                                                                                           \
+        return {output, uint32_t(!out_of_bounds)};                                                                                             \
+    }                                                                                                                                          \
+                                                                                                                                               \
+    uint32_t FUNC(shfl_lds_##mode##_b32)(uint32_t input, int32_t delta, uint32_t opts, uint32_t membermask)                                    \
+    {                                                                                                                                          \
+        return __zluda_ptx_impl_shfl_lds_##mode##_b32_pred(input, delta, opts, membermask).x;                                                  \
+    }
+
+    SHFL_LDS_IMPL(up, self - delta, <);
+    SHFL_LDS_IMPL(down, self + delta, >);
+    SHFL_LDS_IMPL(bfly, self ^ delta, >);
+    SHFL_LDS_IMPL(idx, (delta & ~section_mask) | subsection, >);
+    // ============================================================================
+    // END VEGA TASK D LDS scratchpad block
+    // ============================================================================
 
     DECLARE_ATTR(uint32_t, CLOCK_RATE);
     void FUNC(nanosleep_u32)(uint32_t nanoseconds)
@@ -309,14 +492,16 @@ extern "C"
             __builtin_amdgcn_s_sleep(1);
     }
 
-    void FUNC(__assertfail)(uint64_t message,
-                            uint64_t file,
-                            uint32_t line,
-                            uint64_t function,
-                            uint64_t char_size)
+    // VEGA-FIX T14:35: __assert_fail non disponibile in HIP gfx906 device libs.
+    // Stub abort() per preservare ABI senza dipendenza glibc-style assert.
+    extern "C" __device__ void abort(void);
+    void FUNC(__assertfail)(uint64_t message __attribute__((unused)),
+                            uint64_t file __attribute__((unused)),
+                            uint32_t line __attribute__((unused)),
+                            uint64_t function __attribute__((unused)),
+                            uint64_t char_size __attribute__((unused)))
     {
-        (void)char_size;
-        __assert_fail((const char *)message, (const char *)file, line, (const char *)function);
+        abort();
     }
 
     // * Smallest denormal is 1.4 × 10^-45
@@ -550,84 +735,90 @@ extern "C"
         return div_f32_part2(x, y, {fma_4, fma_1, fma_3, numerator_scaled_flag});
     }
 
-    __device__ static __hip_fp8_storage_t cvt_float_to_fp8(float f, __hip_fp8_interpretation_t interp)
-    {
-        const uint32_t bits = reinterpret_cast<uint32_t &>(f);
-        const uint8_t sign = (bits & 0x80000000) ? 0x80 : 0x0;
-        const uint32_t abs = bits & 0x7fffffff;
-
-        const uint32_t min = interp == __HIP_E4M3 ? 0x3A800000 : 0x37000000;
-        if (abs < min)
-        {
-            return sign; // +/- 0
-        }
-
-        return __hip_cvt_float_to_fp8(f, __HIP_SATFINITE, interp);
-    }
-
+    // VEGA-FIX T14:30 23 giu: fp8 NON supportato gfx906 hardware. Stub functions ritornano 0
+    // (preserva ABI per dispatcher PTX, ma kernel torch normali NON chiamano fp8 su Vega 20).
+    // Headers ROCm 6.2 non hanno __hip_fp8x2_e4m3 (solo _fnuz). Skippiamo definizioni reali.
     struct Fp8x2
     {
-        __hip_fp8_storage_t b : 8;
-        __hip_fp8_storage_t a : 8;
+        uint8_t b;
+        uint8_t a;
     };
 
-    Fp8x2 FUNC(cvt_rn_satfinite_e4m3x2_f32)(float a, float b)
+    Fp8x2 FUNC(cvt_rn_satfinite_e4m3x2_f32)(float a __attribute__((unused)), float b __attribute__((unused)))
     {
-        // If built-in support for fp8 formats is added to LLVM IR we should switch to use that.
-        return {cvt_float_to_fp8(b, __HIP_E4M3), cvt_float_to_fp8(a, __HIP_E4M3)};
+        return {0, 0};
     }
 
-    Fp8x2 FUNC(cvt_rn_satfinite_e5m2x2_f32)(float a, float b)
+    Fp8x2 FUNC(cvt_rn_satfinite_e5m2x2_f32)(float a __attribute__((unused)), float b __attribute__((unused)))
     {
-        return {cvt_float_to_fp8(b, __HIP_E5M2), cvt_float_to_fp8(a, __HIP_E5M2)};
+        return {0, 0};
     }
 
-    __half2 FUNC(cvt_rn_f16x2_e4m3x2)(__hip_fp8x2_e4m3 in)
+    // return type uint32_t (raw 2x f16 packed bits) per evitare dipendenza __half2 da hip_fp8.h
+    uint32_t FUNC(cvt_rn_f16x2_e4m3x2)(uint16_t in __attribute__((unused)))
     {
-        return in;
+        return 0;
     }
 
-    __half2 FUNC(cvt_rn_f16x2_e5m2x2)(__hip_fp8x2_e5m2 in)
+    uint32_t FUNC(cvt_rn_f16x2_e5m2x2)(uint16_t in __attribute__((unused)))
     {
-        return in;
+        return 0;
     }
 
-    __device__ static inline uint32_t ballot(bool value, bool negate)
+    // VEGA-FIX T14:30 23 giu: ballot per gfx906 wave64 (era _w32 i32 RDNA, fail clang Cannot select i32 SETCC)
+    __device__ static inline uint64_t ballot(bool value, bool negate)
     {
         __builtin_amdgcn_wave_barrier();
-        return __builtin_amdgcn_ballot_w32(negate ? !value : value);
+        return __builtin_amdgcn_ballot_w64(negate ? !value : value);
+    }
+
+    // [VEGA-FIX WAVE64-WARP 4 lug 2026] ballot confinato al torch-warp da 32 lane.
+    // ballot_w64 ballotta tutte le 64 lane della wavefront e IGNORA membermask; il vecchio
+    // (uint32_t)ballot teneva sempre le hw-lane 0-31 -> per il torch-warp alto [32-63] restituiva
+    // i bit del torch-warp basso -> __clz/__ffs del look-back cub sceglievano il tile sbagliato.
+    // Estraggo i 32 bit della MIA subsection: base = laneid & 0x20 (0 o 32), poi >> base.
+    __device__ static inline uint32_t ballot32(bool value, bool negate)
+    {
+        uint64_t full = ballot(value, negate);
+        uint32_t base = (uint32_t)__lane_id() & 0x20U;
+        return (uint32_t)(full >> base);
     }
 
     bool FUNC(vote_sync_any_pred)(bool value, uint32_t membermask __attribute__((unused)))
     {
-        return ballot(value, false) != 0;
+        return ballot32(value, false) != 0U;
     }
 
     bool FUNC(vote_sync_any_pred_negate)(bool value, uint32_t membermask __attribute__((unused)))
     {
-        return ballot(value, true) != 0;
+        return ballot32(value, true) != 0U;
     }
 
     // IMPORTANT: exec mask must be a subset of membermask, the behavior is undefined otherwise
+    // VEGA-FIX T14:30: __builtin_amdgcn_read_exec() full i64 (era _lo i32 wave32)
+    // WAVE64-WARP 4 lug: confronto confinato alla subsection (exec dei MIEI 32 lane).
     bool FUNC(vote_sync_all_pred)(bool value, uint32_t membermask __attribute__((unused)))
     {
-        return ballot(value, false) == __builtin_amdgcn_read_exec_lo();
+        uint32_t base = (uint32_t)__lane_id() & 0x20U;
+        uint32_t sub_exec = (uint32_t)(__builtin_amdgcn_read_exec() >> base);
+        return ballot32(value, false) == sub_exec;
     }
 
     // also known as "none"
     bool FUNC(vote_sync_all_pred_negate)(bool value, uint32_t membermask __attribute__((unused)))
     {
-        return ballot(value, false) == 0;
+        return ballot32(value, false) == 0U;
     }
 
+    // PTX ballot.b32 ritorna 32-bit = la MIA subsection di 32 lane (WAVE64-WARP 4 lug).
     uint32_t FUNC(vote_sync_ballot_b32)(bool value, uint32_t membermask __attribute__((unused)))
     {
-        return ballot(value, false);
+        return ballot32(value, false);
     }
 
     uint32_t FUNC(vote_sync_ballot_b32_negate)(bool value, uint32_t membermask __attribute__((unused)))
     {
-        return ballot(value, true);
+        return ballot32(value, true);
     }
 
 #define REDUX_SYNC_TYPE_IMPL(reducer, ptx_type, amd_type, cpp_type)                                             \

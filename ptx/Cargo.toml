@@ -35,3 +35,12 @@ libloading = "0.8"
 
 [features]
 ci_build = []
+# VEGA TASK D 30 giu 2026 — opt-in pass che riscrive ShflSync bfly/idx/up/down
+# in chiamate a `shfl_lds_*_b32` (LDS write+barrier+read scratchpad)
+# invece di `shfl_sync_*_b32` (che internamente usa __builtin_amdgcn_ds_bpermute).
+# Motivazione: composite 709 backward LN2 in graph autograd PyTorch ATen su wave64
+# innesca TDR Windows quando ds_bpermute viene scheduled in successione butterfly
+# log2(N) volte; il fallback LDS scratchpad espone barriere __syncthreads esplicite
+# che PyTorch tratta come safepoint deterministico e WDDM non killa.
+# Vedi sediment ZLUDA.md categoria TASK-D + REGOLE_TASSATIVE.md regola 17.
+wave64_lds_scratchpad = []

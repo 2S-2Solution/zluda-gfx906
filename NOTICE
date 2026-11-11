@@ -1,0 +1,17 @@
+zluda-gfx906 — fork of ZLUDA for AMD Radeon VII (gfx906) on Windows
+
+ZLUDA
+  Copyright (c) Andrzej Janik and the ZLUDA contributors
+  https://github.com/vosen/ZLUDA
+  Licensed under the Apache License, Version 2.0 (LICENSE-APACHE) or the MIT
+  license (LICENSE-MIT), at your option.
+
+Modifications in this fork (branch gfx906-windows, on top of upstream commit
+aa47713c8139f3791c042cf1034e483e6e181668)
+  Copyright (c) 2026 2 Solution (https://www.2solution.it)
+  Distributed under the same terms: Apache-2.0 or MIT, at your option.
+
+Modified files carry "VEGA-PATCH" comments where the change was made.
+This software interfaces with AMD ROCm/HIP, MIOpen and rocBLAS (MIT licensed,
+Copyright Advanced Micro Devices, Inc.), which are not included in this repository.
+CUDA and cuDNN are trademarks of NVIDIA Corporation; no NVIDIA code is included.

@@ -1,0 +1,26 @@
+[package]
+name = "zluda_cufft"
+version = "0.0.0"
+edition = "2021"
+
+# VEGA-PATCH 2026-06-30 TASK 5 — cufft64_10.dll + cufft64_11.dll
+# Backend: hipfft 5.7 ROCm (gfx906). Bug 6: torch.fft.* / Whisper / SD-XL VAE.
+[lib]
+crate-type = ["cdylib"]
+name = "cufft"
+
+[dependencies]
+hipfft-sys = { path = "../ext/hipfft-sys" }
+hip_runtime-sys = { path = "../ext/hip_runtime-sys" }
+cuda_types = { path = "../cuda_types" }
+cuda_macros = { path = "../cuda_macros" }
+
+[target.'cfg(windows)'.dependencies]
+zluda_windows = { path = "../zluda_windows" }
+
+[package.metadata.zluda]
+linux_symlinks = [
+    "libcufft.so.10",
+    "libcufft.so.11",
+]
+windows_paths = ["cufft64_10.dll", "cufft64_11.dll"]

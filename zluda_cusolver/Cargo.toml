@@ -1,0 +1,30 @@
+[package]
+name = "zluda_cusolver"
+version = "0.0.0"
+authors = ["2 Solution <info@2solution.it>"]
+edition = "2021"
+
+# VEGA-PATCH 2026-06-30 T16:30 — UPGRADE worker G6 sprint chiusura totale ZLUDA
+# (Vega ⭐, pattern bottega italiana sovrana)
+#
+# Da stub graceful (T15:55) → wrap REALE rocSOLVER ROCm 5.7.
+# Coverage S/D float+double per: gesvd, geqrf, orgqr, potrf, potrs, syevd,
+# getrf, getrs. Variant C/Z complex e 64-bit X-API → graceful NOT_SUPPORTED
+# (torch fa fallback CPU MAGMA). Dispatch dinamico via libloading verso
+# rocsolver.dll (C:\Program Files\AMD\ROCm\5.7\bin\) — ZERO link-time
+# coupling (la DLL viene caricata al primo use). Regola 4-bis ESCLUSIVO.
+#
+# Target chiamanti V1: torch.linalg.{svd, qr, cholesky, eigh, solve}
+# wheel cu118/cu121 — copre la quasi totalita' degli usi.
+
+[lib]
+crate-type = ["cdylib"]
+name = "cusolver"
+
+[dependencies]
+# Nessuna dipendenza esterna: usiamo kernel32 LoadLibraryA/GetProcAddress raw
+# (vedi src/lib.rs mod loader), così la crate resta leggera e build-veloce.
+
+[package.metadata.zluda]
+linux_symlinks = ["libcusolver.so.10", "libcusolver.so.11", "libcusolver.so.12"]
+windows_paths = ["cusolver64_10.dll", "cusolver64_11.dll", "cusolver64_12.dll"]

@@ -178,6 +178,8 @@ from_cuda_nop!(
     *mut usize,
     *const f32,
     *mut f32,
+    *const f64,
+    *mut f64,
     *const ::core::ffi::c_void,
     *const *const ::core::ffi::c_void,
     *const *mut ::core::ffi::c_void,
@@ -230,7 +232,6 @@ from_cuda_nop!(
 from_cuda_transmute!(
     CUuuid => hipUUID,
     CUfunction => hipFunction_t,
-    CUstream => hipStream_t,
     CUpointer_attribute => hipPointer_attribute,
     CUdeviceptr_v2 => hipDeviceptr_t,
     CUevent => hipEvent_t,
@@ -250,6 +251,43 @@ from_cuda_transmute!(
     cudnn9::cudnnFilterDescriptor_t => miopenTensorDescriptor_t,
     cudnn9::cudnnConvolutionDescriptor_t => miopenConvolutionDescriptor_t
 );
+
+// [VEGA-PATCH stream-nullo, 17 ott 2026] CUstream non passa piu' dal transmute.
+// CU_STREAM_LEGACY (0x1) e' lo stream predefinito "legacy" di CUDA, cioe' lo stream
+// nullo di HIP. Il runtime HIP 5.7.31541 del driver Adrenalin non conosce 0x1: lo
+// tratta come un handle qualunque e risponde hipErrorContextIsDestroyed (misurato).
+// Qui lo si traduce nel nullo. CU_STREAM_PER_THREAD (0x2) coincide con
+// hipStreamPerThread e passa intatto, come ogni altro handle.
+// Le altre tre conversioni sono identiche a quelle che generava from_cuda_transmute.
+impl<'a, E: CudaErrorType> FromCuda<'a, CUstream, E> for hipStream_t {
+    fn from_cuda(x: &'a CUstream) -> Result<Self, E> {
+        if x.0 as usize == 1 {
+            return Ok(hipStream_t(std::ptr::null_mut()));
+        }
+        Ok(unsafe { std::mem::transmute(*x) })
+    }
+}
+
+impl<'a, E: CudaErrorType> FromCuda<'a, *mut CUstream, E> for &'a mut hipStream_t {
+    fn from_cuda(x: &'a *mut CUstream) -> Result<Self, E> {
+        match unsafe { x.cast::<hipStream_t>().as_mut() } {
+            Some(x) => Ok(x),
+            None => Err(E::INVALID_VALUE),
+        }
+    }
+}
+
+impl<'a, E: CudaErrorType> FromCuda<'a, *mut CUstream, E> for *mut hipStream_t {
+    fn from_cuda(x: &'a *mut CUstream) -> Result<Self, E> {
+        Ok(x.cast::<hipStream_t>())
+    }
+}
+
+impl<'a, E: CudaErrorType> FromCuda<'a, *mut *const CUstream, E> for *mut *const hipStream_t {
+    fn from_cuda(x: &'a *mut *const CUstream) -> Result<Self, E> {
+        Ok(x.cast::<*const hipStream_t>())
+    }
+}
 
 impl<'a, E: CudaErrorType> FromCuda<'a, CUjit_option, E> for hipJitOption {
     fn from_cuda(option: &'a CUjit_option) -> Result<Self, E> {

@@ -12862,6 +12862,46 @@ extern "C" {
 */
     pub fn hipGraphicsUnregisterResource(resource: hipGraphicsResource_t) -> hipError_t;
 }
+// VEGA-PATCH 2026-06-30 T16:00 GL-INTEROP: bindings mancanti per cuGL bridge.
+// amdhip64.dll esporta queste 4 funzioni (vedi amdhip64.def righe 242/332/333/337).
+// Le aggiungo qui manualmente perche' bindgen non le aveva generate.
+extern "C" {
+    #[must_use]
+    /** @brief Registers an OpenGL buffer object for CUDA access. */
+    pub fn hipGraphicsGLRegisterBuffer(
+        resource: *mut hipGraphicsResource_t,
+        buffer: ::core::ffi::c_uint,
+        flags: ::core::ffi::c_uint,
+    ) -> hipError_t;
+}
+extern "C" {
+    #[must_use]
+    /** @brief Registers an OpenGL texture/renderbuffer for CUDA access. */
+    pub fn hipGraphicsGLRegisterImage(
+        resource: *mut hipGraphicsResource_t,
+        image: ::core::ffi::c_uint,
+        target: ::core::ffi::c_uint,
+        flags: ::core::ffi::c_uint,
+    ) -> hipError_t;
+}
+extern "C" {
+    #[must_use]
+    /** @brief Gets HIP devices associated with the current OpenGL context. */
+    pub fn hipGLGetDevices(
+        pHipDeviceCount: *mut ::core::ffi::c_uint,
+        pHipDevices: *mut ::core::ffi::c_int,
+        hipDeviceCount: ::core::ffi::c_uint,
+        deviceList: ::core::ffi::c_uint,
+    ) -> hipError_t;
+}
+extern "C" {
+    #[must_use]
+    /** @brief Sets the access flags for a mapped graphics resource. */
+    pub fn hipGraphicsResourceSetMapFlags(
+        resource: hipGraphicsResource_t,
+        flags: ::core::ffi::c_uint,
+    ) -> hipError_t;
+}
 extern "C" {
     #[must_use]
     /** @brief Create a surface object.

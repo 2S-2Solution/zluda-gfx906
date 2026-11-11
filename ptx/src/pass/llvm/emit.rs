@@ -153,6 +153,33 @@ impl<'a, 'input> ModuleEmitContext<'a, 'input> {
                 "denormal-fp-math",
                 llvm_ftz(method.flush_to_zero_f16f64),
             );
+            // VEGA-FIX T13:15 23 giu strada B: per kernel torch wheel (chiamati esternamente
+            // via cuModuleGetFunction), preserva da AMDGPU AttributorPass + InternalizeSymbols
+            // via attributi LLVM string che AMDGPU pass riconoscono.
+            self.emit_fn_attribute(fn_, "amdgpu-no-internalize", "true");
+            // VEGA-FIX T15:32 30 giu sup wf_078367e9 consensus W2-P2: per kernel ATen
+            // template-lambda nested triplo (es. sqrt_kernel_cuda UlvE0_clEvENKUlvE0_clEvEUlfE_,
+            // BCE, vector_norm, _foreach_*) AMDGPU GlobalDCE pass elimina symbol nonostante
+            // amdgpu-no-internalize + @llvm.used module-level (compile.rs:181-203). Forza
+            // sezione ELF custom .text.amdgpu_kernel che il pass NON tocca (difesa ortogonale
+            // a livello function vs module). Symbol sopravvive 1:1 con nome mangled PTX.
+            unsafe {
+                LLVMSetSection(fn_, c".text.amdgpu_kernel".as_ptr().cast());
+            }
+            // VEGA-FIX T18:35 30 giu AGENT-A name-preservation L1: force-set kernel
+            // value name EXPLICIT con il nome PTX originale (Itanium mangled C++).
+            // Garantisce che LLVM non rinomini per collisione bucket/hash interna
+            // e che AMDGPU AsmPrinter veda LO STESSO nome usato da
+            // PyTorch::cuModuleGetFunction. Idempotente quando già allineato.
+            unsafe {
+                LLVMSetValueName2(fn_, name.as_ptr().cast(), name.as_bytes().len());
+            }
+            // Marca come usato/referenced esternamente
+            unsafe {
+                LLVMSetLinkage(fn_, llvm_zluda::LLVMLinkage::LLVMExternalLinkage);
+                LLVMSetVisibility(fn_, llvm_zluda::LLVMVisibility::LLVMProtectedVisibility);
+                LLVMSetUnnamedAddress(fn_, llvm_zluda::LLVMUnnamedAddr::LLVMNoUnnamedAddr);
+            }
         }
         self.emit_fn_attribute(fn_, "amdgpu-ieee", "false");
         for (i, param) in method.input_arguments.iter().enumerate() {
@@ -357,8 +384,13 @@ impl<'a, 'input> ModuleEmitContext<'a, 'input> {
     }
 
     fn emit_target_features(&mut self, fn_: LLVMValueRef) {
+        // VEGA-FIX T13:25 23 giu: ZLUDA upstream hardcoda wave32 (RDNA/CDNA target).
+        // Per gfx906 (Vega 20, GCN5) wave32 NON ESISTE in hardware → AMDGPU codegen
+        // invalida i kernel + DCE li rimuove. gfx906 è wave64-only.
+        // Detect attraverso oclc_wavefrontsize64 constant (settato a 0 per RDNA, 1 per GCN5).
+        // Approccio semplice: usiamo +wavefrontsize64 SEMPRE per ZLUDA gfx906 build.
         let value = format!(
-            "+wavefrontsize32,-wavefrontsize64,+cumode{}",
+            "+wavefrontsize64,+cumode{}",
             if cfg!(debug_assertions) {
                 ",+precise-memory"
             } else {
@@ -412,6 +444,9 @@ struct MethodEmitContext<'a> {
     builder: LLVMBuilderRef,
     variables_builder: Builder,
     resolver: &'a mut ResolveIdent,
+    // VEGA 3 lug: flag di riporto CC.CF per l'aritmetica estesa (add.cc/addc/mad.cc/...).
+    // i1 threaded fra istruzioni consecutive nello stesso basic block.
+    carry_flag: Option<LLVMValueRef>,
 }
 
 impl<'a> MethodEmitContext<'a> {
@@ -427,6 +462,7 @@ impl<'a> MethodEmitContext<'a> {
             variables_builder,
             resolver: &mut parent.resolver,
             method,
+            carry_flag: None,
         }
     }
 
@@ -525,7 +561,10 @@ impl<'a> MethodEmitContext<'a> {
             ast::Instruction::Mov { data: _, arguments } => self.emit_mov(arguments),
             ast::Instruction::Ld { data, arguments } => self.emit_ld(data, arguments),
             ast::Instruction::Add { data, arguments } => self.emit_add(data, arguments),
+            ast::Instruction::AddCarry { data, arguments } => self.emit_add_carry(data, arguments),
+            ast::Instruction::MadCarry { data, arguments } => self.emit_mad_carry(data, arguments),
             ast::Instruction::Dp4a { data, arguments } => self.emit_dp4a(data, arguments),
+            ast::Instruction::Vshr { data, arguments } => self.emit_vshr(data, arguments),
             ast::Instruction::St { data, arguments } => self.emit_st(data, arguments),
             ast::Instruction::Mul { data, arguments } => self.emit_mul(data, arguments),
             ast::Instruction::Mul24 { data, arguments } => self.emit_mul24(data, arguments),
@@ -564,6 +603,7 @@ impl<'a> MethodEmitContext<'a> {
             ast::Instruction::Lg2 { data, arguments } => self.emit_lg2(data, arguments),
             ast::Instruction::Ex2 { data, arguments } => self.emit_ex2(data, arguments),
             ast::Instruction::Clz { data, arguments } => self.emit_clz(data, arguments),
+            ast::Instruction::Bfind { data, arguments } => self.emit_bfind(data, arguments),
             ast::Instruction::Brev { data, arguments } => self.emit_brev(data, arguments),
             ast::Instruction::Popc { data, arguments } => self.emit_popc(data, arguments),
             ast::Instruction::Xor { data, arguments } => self.emit_xor(data, arguments),
@@ -571,6 +611,7 @@ impl<'a> MethodEmitContext<'a> {
             ast::Instruction::BarWarp { .. } => self.emit_bar_warp(),
             ast::Instruction::Membar { data } => self.emit_membar(data),
             ast::Instruction::Trap {} => self.emit_trap(),
+            ast::Instruction::Exit {} => self.emit_exit(),
             ast::Instruction::Tanh { data, arguments } => self.emit_tanh(data, arguments),
             ast::Instruction::CpAsync { data, arguments } => self.emit_cp_async(data, arguments),
             ast::Instruction::Copysign { data, arguments } => self.emit_copysign(data, arguments),
@@ -614,6 +655,12 @@ impl<'a> MethodEmitContext<'a> {
         let src = self.resolver.value(arguments.src)?;
         let load = unsafe { LLVMBuildLoad2(builder, op_type, src, LLVM_UNNAMED.as_ptr()) };
         apply_qualifier(load, data.qualifier)?;
+        // Il `volatile` sulle load .cg/.cv e' pronto (vedi applica_coerenza_cache) ma
+        // NON e' agganciato: misurato il 31 lug 2026, non cambia nulla sui sintomi
+        // (cumsum resta corretto fino a n=1024 ed errato da 4096, identico a senza).
+        // Agganciarlo anche sugli store peggiora invece nettamente. Si lascia spento
+        // finche' non c'e' un guadagno dimostrato.
+        let _ = bypassa_l1_in_lettura;
         unsafe { LLVMSetAlignment(load, data.typ.layout().align() as u32) };
         if needs_cast {
             self.resolver.with_result(arguments.dst, |dst| unsafe {
@@ -824,6 +871,109 @@ impl<'a> MethodEmitContext<'a> {
         Ok(())
     }
 
+    // VEGA 3 lug: add/sub con riporto (extended-precision). Calcolo a 64 bit (sempre unsigned
+    // per la semantica del carry PTX), dst = trunc a 32, carry/borrow = bit 32 del risultato.
+    fn emit_add_carry(
+        &mut self,
+        data: ast::AddCarryDetails,
+        arguments: ast::AddCarryArgs<SpirvWord>,
+    ) -> Result<(), TranslateError> {
+        let builder = self.builder;
+        let i64t = unsafe { LLVMInt64TypeInContext(self.context) };
+        let i32t = get_scalar_type(self.context, data.type_);
+        let src1 = self.resolver.value(arguments.src1)?;
+        let src2 = self.resolver.value(arguments.src2)?;
+        let a = unsafe { LLVMBuildZExt(builder, src1, i64t, LLVM_UNNAMED.as_ptr()) };
+        let b = unsafe { LLVMBuildZExt(builder, src2, i64t, LLVM_UNNAMED.as_ptr()) };
+        let mut acc = unsafe {
+            if data.subtract {
+                LLVMBuildSub(builder, a, b, LLVM_UNNAMED.as_ptr())
+            } else {
+                LLVMBuildAdd(builder, a, b, LLVM_UNNAMED.as_ptr())
+            }
+        };
+        if data.carry_in {
+            let cin = self.carry_flag.ok_or_else(error_unreachable)?;
+            let cin64 = unsafe { LLVMBuildZExt(builder, cin, i64t, LLVM_UNNAMED.as_ptr()) };
+            acc = unsafe {
+                if data.subtract {
+                    LLVMBuildSub(builder, acc, cin64, LLVM_UNNAMED.as_ptr())
+                } else {
+                    LLVMBuildAdd(builder, acc, cin64, LLVM_UNNAMED.as_ptr())
+                }
+            };
+        }
+        if data.carry_out {
+            let sh = unsafe { LLVMConstInt(i64t, 32, 0) };
+            let shifted = unsafe { LLVMBuildLShr(builder, acc, sh, LLVM_UNNAMED.as_ptr()) };
+            let i1t = unsafe { LLVMInt1TypeInContext(self.context) };
+            let cout = unsafe { LLVMBuildTrunc(builder, shifted, i1t, LLVM_UNNAMED.as_ptr()) };
+            self.carry_flag = Some(cout);
+        }
+        self.resolver.with_result(arguments.dst, |dst| unsafe {
+            LLVMBuildTrunc(builder, acc, i32t, dst)
+        });
+        Ok(())
+    }
+
+    // VEGA 3 lug: mul-add con riporto. prodotto 64-bit (sext se signed), parte lo/hi a 32,
+    // accumulo unsigned a 64 con c [+ carry_in], carry_out = bit 32.
+    fn emit_mad_carry(
+        &mut self,
+        data: ast::MadCarryDetails,
+        arguments: ast::MadCarryArgs<SpirvWord>,
+    ) -> Result<(), TranslateError> {
+        let builder = self.builder;
+        let i64t = unsafe { LLVMInt64TypeInContext(self.context) };
+        let i32t = get_scalar_type(self.context, data.type_);
+        let signed = data.type_.kind() == ast::ScalarKind::Signed;
+        let src1 = self.resolver.value(arguments.src1)?;
+        let src2 = self.resolver.value(arguments.src2)?;
+        let src3 = self.resolver.value(arguments.src3)?;
+        let (a64, b64) = unsafe {
+            if signed {
+                (
+                    LLVMBuildSExt(builder, src1, i64t, LLVM_UNNAMED.as_ptr()),
+                    LLVMBuildSExt(builder, src2, i64t, LLVM_UNNAMED.as_ptr()),
+                )
+            } else {
+                (
+                    LLVMBuildZExt(builder, src1, i64t, LLVM_UNNAMED.as_ptr()),
+                    LLVMBuildZExt(builder, src2, i64t, LLVM_UNNAMED.as_ptr()),
+                )
+            }
+        };
+        let prod = unsafe { LLVMBuildMul(builder, a64, b64, LLVM_UNNAMED.as_ptr()) };
+        let part32 = unsafe {
+            let p = if data.hi {
+                let sh = LLVMConstInt(i64t, 32, 0);
+                LLVMBuildLShr(builder, prod, sh, LLVM_UNNAMED.as_ptr())
+            } else {
+                prod
+            };
+            LLVMBuildTrunc(builder, p, i32t, LLVM_UNNAMED.as_ptr())
+        };
+        let acc0 = unsafe { LLVMBuildZExt(builder, part32, i64t, LLVM_UNNAMED.as_ptr()) };
+        let c64 = unsafe { LLVMBuildZExt(builder, src3, i64t, LLVM_UNNAMED.as_ptr()) };
+        let mut acc = unsafe { LLVMBuildAdd(builder, acc0, c64, LLVM_UNNAMED.as_ptr()) };
+        if data.carry_in {
+            let cin = self.carry_flag.ok_or_else(error_unreachable)?;
+            let cin64 = unsafe { LLVMBuildZExt(builder, cin, i64t, LLVM_UNNAMED.as_ptr()) };
+            acc = unsafe { LLVMBuildAdd(builder, acc, cin64, LLVM_UNNAMED.as_ptr()) };
+        }
+        if data.carry_out {
+            let sh = unsafe { LLVMConstInt(i64t, 32, 0) };
+            let shifted = unsafe { LLVMBuildLShr(builder, acc, sh, LLVM_UNNAMED.as_ptr()) };
+            let i1t = unsafe { LLVMInt1TypeInContext(self.context) };
+            let cout = unsafe { LLVMBuildTrunc(builder, shifted, i1t, LLVM_UNNAMED.as_ptr()) };
+            self.carry_flag = Some(cout);
+        }
+        self.resolver.with_result(arguments.dst, |dst| unsafe {
+            LLVMBuildTrunc(builder, acc, i32t, dst)
+        });
+        Ok(())
+    }
+
     fn emit_st(
         &self,
         data: ast::StData,
@@ -845,6 +995,11 @@ impl<'a> MethodEmitContext<'a> {
         }
         let store = unsafe { LLVMBuildStore(self.builder, value, ptr) };
         apply_qualifier(store, data.qualifier)?;
+        // Sugli store il bit di coerenza non serve: su GCN la L1 e' write-through,
+        // quindi la scrittura raggiunge comunque la L2. Marcarli volatile inserisce
+        // un s_waitcnt dopo ogni store e, misurato il 31 lug 2026, peggiora:
+        // cumsum passava da corretto fino a n=1024 a errato ovunque.
+        let _ = bypassa_l1_in_scrittura;
         unsafe {
             LLVMSetAlignment(store, data.typ.layout().align() as u32);
         }
@@ -1077,6 +1232,76 @@ impl<'a> MethodEmitContext<'a> {
         Ok(())
     }
 
+    /// [VEGA-PATCH bfind, 17 ott 2026] bfind via llvm.ctlz:
+    ///   x   = (signed && a < 0) ? ~a : a      // bit piu' significativo NON di segno
+    ///   pos = (bits-1) - ctlz(x)               // bfind
+    ///   amt = ctlz(x)                          // bfind.shiftamt
+    ///   x == 0 -> 0xFFFFFFFF in entrambi i casi (nessun bit trovato)
+    /// Il risultato e' sempre u32.
+    fn emit_bfind(
+        &mut self,
+        data: ptx_parser::BfindDetails,
+        arguments: ptx_parser::BfindArgs<SpirvWord>,
+    ) -> Result<(), TranslateError> {
+        let bits = data.type_.size_of() as u64 * 8;
+        let llvm_fn = match bits {
+            32 => c"llvm.ctlz.i32",
+            64 => c"llvm.ctlz.i64",
+            _ => return Err(error_unreachable()),
+        };
+        let builder = self.builder;
+        let type_ = get_scalar_type(self.context, data.type_.into());
+        let pred = get_scalar_type(self.context, ast::ScalarType::Pred);
+        let i32t = get_scalar_type(self.context, ast::ScalarType::U32);
+        let fn_type = get_function_type(
+            self.context,
+            iter::once(&data.type_.into()),
+            [Ok(type_), Ok(pred)].into_iter(),
+        )?;
+        let mut fn_ = unsafe { LLVMGetNamedFunction(self.module, llvm_fn.as_ptr()) };
+        if fn_ == ptr::null_mut() {
+            fn_ = unsafe { LLVMAddFunction(self.module, llvm_fn.as_ptr(), fn_type) };
+        }
+        let src = self.resolver.value(arguments.src)?;
+        let zero = unsafe { LLVMConstInt(type_, 0, 0) };
+        let x = if data.type_.kind() == ast::ScalarKind::Signed {
+            unsafe {
+                let negativo = LLVMBuildICmp(builder, LLVMIntPredicate::LLVMIntSLT, src, zero, LLVM_UNNAMED.as_ptr());
+                let tutti_uno = LLVMConstInt(type_, u64::MAX, 0);
+                let invertito = LLVMBuildXor(builder, src, tutti_uno, LLVM_UNNAMED.as_ptr());
+                LLVMBuildSelect(builder, negativo, invertito, src, LLVM_UNNAMED.as_ptr())
+            }
+        } else {
+            src
+        };
+        // is_zero_poison = false: con x == 0 ctlz vale `bits`, ma quel caso e' comunque
+        // sostituito sotto da 0xFFFFFFFF.
+        let false_ = unsafe { LLVMConstInt(pred, 0, 0) };
+        let mut args = [x, false_];
+        let conteggio = unsafe {
+            LLVMBuildCall2(builder, fn_type, fn_, args.as_mut_ptr(), args.len() as u32, LLVM_UNNAMED.as_ptr())
+        };
+        let conteggio32 = if bits == 64 {
+            unsafe { LLVMBuildTrunc(builder, conteggio, i32t, LLVM_UNNAMED.as_ptr()) }
+        } else {
+            conteggio
+        };
+        let valore = if data.shift_amount {
+            conteggio32
+        } else {
+            unsafe {
+                let massimo = LLVMConstInt(i32t, bits - 1, 0);
+                LLVMBuildSub(builder, massimo, conteggio32, LLVM_UNNAMED.as_ptr())
+            }
+        };
+        let nessuno = unsafe { LLVMBuildICmp(builder, LLVMIntPredicate::LLVMIntEQ, x, zero, LLVM_UNNAMED.as_ptr()) };
+        let tutti_uno32 = unsafe { LLVMConstInt(i32t, 0xFFFF_FFFF, 0) };
+        self.resolver.with_result(arguments.dst, |dst| unsafe {
+            LLVMBuildSelect(builder, nessuno, tutti_uno32, valore, dst)
+        });
+        Ok(())
+    }
+
     fn emit_clz(
         &mut self,
         data: ptx_parser::ScalarType,
@@ -1089,9 +1314,13 @@ impl<'a> MethodEmitContext<'a> {
         };
         let type_ = get_scalar_type(self.context, data.into());
         let pred = get_scalar_type(self.context, ast::ScalarType::Pred);
+        // VEGA 3 lug FIX: il tipo di ritorno dell'intrinseco llvm.ctlz.iN e' iN (i32/i64),
+        // NON U32 fisso. Con U32 hardcoded, clz.b64 generava @llvm.ctlz.i64 malformato
+        // ("Intrinsic has incorrect argument type"). PTX clz ritorna sempre u32: per b64
+        // chiamo l'intrinseco (ritorna i64) e tronco a i32 nel dst.
         let fn_type = get_function_type(
             self.context,
-            iter::once(&ast::ScalarType::U32.into()),
+            iter::once(&data.into()),
             [Ok(type_), Ok(pred)].into_iter(),
         )?;
         let mut fn_ = unsafe { LLVMGetNamedFunction(self.module, llvm_fn.as_ptr()) };
@@ -1101,16 +1330,33 @@ impl<'a> MethodEmitContext<'a> {
         let src = self.resolver.value(arguments.src)?;
         let false_ = unsafe { LLVMConstInt(pred, 0, 0) };
         let mut args = [src, false_];
-        self.resolver.with_result(arguments.dst, |dst| unsafe {
-            LLVMBuildCall2(
-                self.builder,
-                fn_type,
-                fn_,
-                args.as_mut_ptr(),
-                args.len() as u32,
-                dst,
-            )
-        });
+        if data.size_of() == 8 {
+            let count = unsafe {
+                LLVMBuildCall2(
+                    self.builder,
+                    fn_type,
+                    fn_,
+                    args.as_mut_ptr(),
+                    args.len() as u32,
+                    LLVM_UNNAMED.as_ptr(),
+                )
+            };
+            let i32t = get_scalar_type(self.context, ast::ScalarType::U32);
+            self.resolver.with_result(arguments.dst, |dst| unsafe {
+                LLVMBuildTrunc(self.builder, count, i32t, dst)
+            });
+        } else {
+            self.resolver.with_result(arguments.dst, |dst| unsafe {
+                LLVMBuildCall2(
+                    self.builder,
+                    fn_type,
+                    fn_,
+                    args.as_mut_ptr(),
+                    args.len() as u32,
+                    dst,
+                )
+            });
+        }
         Ok(())
     }
 
@@ -2147,6 +2393,10 @@ impl<'a> MethodEmitContext<'a> {
         let type_ = get_scalar_type(self.context, data.type_);
         let intrinsic = match (data.type_, data.kind) {
             (ast::ScalarType::F32, ast::RcpKind::Approx) => c"llvm.amdgcn.rcp.f32",
+            // VEGA-FIX 2 lug (Fable 5): rcp.approx.ftz.f64 (usata da curand normal-double,
+            // torch.randn e trascendenti) mancava -> Unreachable -> intero modulo a 0 kernel
+            // -> err 999. gfx906 ha v_rcp_f64 nativo. Root cause del blocco RNG/attivazioni.
+            (ast::ScalarType::F64, ast::RcpKind::Approx) => c"llvm.amdgcn.rcp.f64",
             (_, ast::RcpKind::Compliant(rnd)) => {
                 return self.emit_rcp_compliant(data, arguments, rnd)
             }
@@ -3085,9 +3335,56 @@ impl<'a> MethodEmitContext<'a> {
         Ok(())
     }
 
+    // VEGA 3 lug: scalar video instruction vshr.u32.u32.u32.clamp.add (cub radix sort →
+    // torch.sort/argsort/topk/randperm). Semantica PTX: d = (a >> clamp(b,32)) + c, u32 logico.
+    // clamp: se b>=32 il risultato dello shift e' 0 (come emit_shr/shf). Poi somma modulare c.
+    fn emit_vshr(
+        &mut self,
+        _data: ast::ScalarType,
+        arguments: ast::VshrArgs<SpirvWord>,
+    ) -> Result<(), TranslateError> {
+        let builder = self.builder;
+        let i32t = get_scalar_type(self.context, ast::ScalarType::U32);
+        let a = self.resolver.value(arguments.src1)?;
+        let b = self.resolver.value(arguments.src2)?;
+        let c = self.resolver.value(arguments.src3)?;
+        let const_32 = unsafe { LLVMConstInt(i32t, 32, 0) };
+        let const_31 = unsafe { LLVMConstInt(i32t, 31, 0) };
+        let zero = unsafe { LLVMConstNull(i32t) };
+        // b >= 32 ?  (clamp)
+        let should_clamp = unsafe {
+            LLVMBuildICmp(
+                builder,
+                LLVMIntPredicate::LLVMIntUGE,
+                b,
+                const_32,
+                LLVM_UNNAMED.as_ptr(),
+            )
+        };
+        // shift sicuro (evita lshr per 32 = poison): se b>=32 usa 31 (verra' scartato dal select)
+        let safe_shift =
+            unsafe { LLVMBuildSelect(builder, should_clamp, const_31, b, LLVM_UNNAMED.as_ptr()) };
+        let raw = unsafe { LLVMBuildLShr(builder, a, safe_shift, LLVM_UNNAMED.as_ptr()) };
+        // clamp: se b>=32 → 0, altrimenti a>>b
+        let shifted =
+            unsafe { LLVMBuildSelect(builder, should_clamp, zero, raw, LLVM_UNNAMED.as_ptr()) };
+        // op secondaria .add: d = shifted + c
+        self.resolver.with_result(arguments.dst, |dst| unsafe {
+            LLVMBuildAdd(builder, shifted, c, dst)
+        });
+        Ok(())
+    }
+
     fn emit_trap(&mut self) -> Result<(), TranslateError> {
         self.emit_intrinsic(c"llvm.trap", None, None, vec![])?;
         unsafe { LLVMBuildUnreachable(self.builder) };
+        Ok(())
+    }
+
+    // VEGA 3 lug: PTX `exit` termina il thread. A livello kernel (dove cub lo usa per l'early-out
+    // dei thread fuori range) equivale a un ritorno dal kernel → ret void (terminatore di blocco).
+    fn emit_exit(&mut self) -> Result<(), TranslateError> {
+        unsafe { LLVMBuildRetVoid(self.builder) };
         Ok(())
     }
 
@@ -3202,6 +3499,58 @@ fn not_supported_by_atomics(qualifier: ast::LdStQualifier, underlying_type: *mut
         )
     }
     !matches!(qualifier, ast::LdStQualifier::Weak) && is_non_scalar_type(underlying_type)
+}
+
+/// I qualificatori di cache PTX chiedono di non passare dalla cache di primo
+/// livello: `.cg` e `.cv` in lettura, `.cg` e `.wt` in scrittura. Su gfx906 la
+/// cache vettoriale L1 e' per-CU e non e' coerente fra CU.
+///
+/// Il campo `caching` di `LdDetails`/`StDetails` veniva riconosciuto dal parser
+/// e mai usato qui: `ld.global.cg` diventava una load qualunque. E' il
+/// meccanismo su cui poggia il decoupled look-back di cub (`ScanTileState`, che
+/// sta sotto unique / randperm / nonzero / topk / scatter_add / cumsum): ogni
+/// tile pubblica il proprio stato e i successivi lo rileggono, contando di
+/// scavalcare la L1. Ignorarlo significa leggere stati stantii, con risultati
+/// non deterministici.
+///
+/// Il rimedio e' `volatile`, non un accesso atomico. Verificato sull'assembly
+/// gfx906 il 31 lug 2026, compilando le tre forme e guardando cosa emettono:
+///
+/// ```text
+/// volatile              ->  global_load_dword v1, v0, s[0:1] glc   <- bypassa L1
+/// atomic relaxed agent  ->  global_load_dword v1, v0, s[0:1]
+/// atomic relaxed system ->  global_load_dword v1, v0, s[0:1]
+/// ```
+///
+/// Solo `volatile` produce il bit `glc`. Un primo tentativo con gli accessi
+/// atomici non solo non avrebbe dato la coerenza voluta, ma generava codice non
+/// valido (`ZLUDA err code=999` su quasi ogni kernel), perche' molte `ld.cg`
+/// operano su puntatori generic.
+///
+/// Sugli store il bit non serve — su GCN la L1 e' write-through, quindi la
+/// scrittura raggiunge comunque la L2 — ma `volatile` si mette lo stesso: vieta
+/// all'ottimizzatore di spostare o eliminare la pubblicazione dello stato.
+fn bypassa_l1_in_lettura(op: ast::LdCacheOperator) -> bool {
+    matches!(
+        op,
+        ast::LdCacheOperator::L2Only | ast::LdCacheOperator::Uncached
+    )
+}
+
+fn bypassa_l1_in_scrittura(op: ast::StCacheOperator) -> bool {
+    matches!(
+        op,
+        ast::StCacheOperator::L2Only | ast::StCacheOperator::Writethrough
+    )
+}
+
+/// Applica la coerenza chiesta dal qualificatore di cache. Solo per accessi
+/// `weak`: gli altri hanno gia' la loro semantica, imposta da `apply_qualifier`
+/// (che per il `volatile` PTX marca volatile *e* atomico).
+fn applica_coerenza_cache(value: LLVMValueRef, qualifier: ast::LdStQualifier, bypassa: bool) {
+    if bypassa && matches!(qualifier, ast::LdStQualifier::Weak) {
+        unsafe { LLVMSetVolatile(value, 1) };
+    }
 }
 
 fn apply_qualifier(

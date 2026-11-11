@@ -1854,6 +1854,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "hipfft-sys"
+version = "0.0.0"
+
+[[package]]
+name = "hiprand-sys"
+version = "0.0.0"
+
+[[package]]
 name = "home"
 version = "0.5.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4012,6 +4020,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "zluda_blaslt12"
+version = "0.0.0"
+dependencies = [
+ "cuda_macros",
+ "cuda_types",
+ "hip_runtime-sys",
+ "hipblaslt-sys",
+ "zluda_common",
+ "zluda_windows",
+]
+
+[[package]]
 name = "zluda_cache"
 version = "0.1.0"
 dependencies = [
@@ -4033,6 +4053,37 @@ dependencies = [
  "miopen-sys",
  "rocblas-sys",
 ]
+
+[[package]]
+name = "zluda_cudart"
+version = "0.0.0"
+dependencies = [
+ "cuda_types",
+ "hip_runtime-sys",
+]
+
+[[package]]
+name = "zluda_cufft"
+version = "0.0.0"
+dependencies = [
+ "cuda_macros",
+ "cuda_types",
+ "hip_runtime-sys",
+ "hipfft-sys",
+ "zluda_windows",
+]
+
+[[package]]
+name = "zluda_curand"
+version = "0.0.0"
+dependencies = [
+ "hip_runtime-sys",
+ "hiprand-sys",
+]
+
+[[package]]
+name = "zluda_cusolver"
+version = "0.0.0"
 
 [[package]]
 name = "zluda_dnn"
@@ -4067,14 +4118,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "zluda_fft"
-version = "0.0.0"
-dependencies = [
- "cuda_macros",
- "cuda_types",
-]
-
-[[package]]
 name = "zluda_inject"
 version = "0.0.0"
 dependencies = [
@@ -4105,6 +4148,26 @@ dependencies = [
  "rocm_smi-sys",
  "zluda_common",
 ]
+
+[[package]]
+name = "zluda_nccl"
+version = "0.0.0"
+
+[[package]]
+name = "zluda_nvjitlink"
+version = "0.0.0"
+dependencies = [
+ "libloading",
+ "zluda_windows",
+]
+
+[[package]]
+name = "zluda_nvjpeg"
+version = "0.0.0"
+
+[[package]]
+name = "zluda_nvrtc"
+version = "0.0.0"
 
 [[package]]
 name = "zluda_precompile"

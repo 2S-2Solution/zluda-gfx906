@@ -1,0 +1,56 @@
+// VEGA TASK D 30 giu 2026 T08:15 WORKER 5/5
+//
+// Smoke PTX test per il pass `rewrite_shfl_to_lds` (feature `wave64_lds_scratchpad`).
+// E' un clone funzionalmente identico a `shfl_sync_bfly_b32_pred.ptx`: stessa
+// signature, stessa istruzione PTX `shfl.sync.bfly.b32`. Il pass rewrite NON
+// agisce al livello PTX (l'istruzione sorgente resta `shfl.sync.bfly.b32`) ma
+// dopo `replace_instructions_with_functions` rinomina la Call sintetizzata
+// `__zluda_ptx_impl_shfl_sync_bfly_b32_pred` -> `__zluda_ptx_impl_shfl_lds_bfly_b32_pred`
+// nel resolver. Cosi' al link-time con `zluda_ptx_impl.bc` viene risolto
+// l'helper LDS scratchpad invece di quello che usa ds_bpermute.
+//
+// Come verificare in pipeline:
+//   1) cargo test --features wave64_lds_scratchpad -p ptx -- shfl_sync_bfly_b32_pred
+//      (il test originale deve passare anche con la feature on perche' il
+//       comportamento osservabile a livello PTX e' identico — entrambe le impl
+//       producono lo stesso permute pattern, solo perf differente)
+//   2) ispezionare il modulo LLVM emesso: deve contenere `call ... @__zluda_ptx_impl_shfl_lds_bfly_b32_pred`
+//      e NON `@__zluda_ptx_impl_shfl_sync_bfly_b32_pred`.
+//
+// NB: non includiamo un .ll di expected output separato perche' il rinominamento
+// avviene tardi nella pipeline e l'output .ll testabile e' lo stesso del test
+// `shfl_sync_bfly_b32_pred.ll` modulo la sostituzione del nome funzione chiamata.
+
+.version 6.5
+.target sm_30
+.address_size 64
+
+.visible .entry shfl_lds_bfly_b32_pred(
+    .param .u64 output
+)
+{
+    .reg .u64 	      out_addr;
+    .reg .u64 	      out_index;
+    .reg .u32         thread_id;
+    .reg .u32         result;
+    .reg .pred        in_range;
+
+    ld.param.u64  	  out_addr, [output];
+    mov.u32           thread_id, %tid.x;
+
+    // result = __shfl_xor_sync(mask=0xFFFFFFFF, thread_id, delta=3, width=32)
+    // c is ((32-width) << 8) | 31
+    // Con feature wave64_lds_scratchpad attiva, ad emit-time questa shfl viene
+    // routed all'helper LDS scratchpad invece di ds_bpermute.
+    shfl.sync.bfly.b32 result|in_range, thread_id, 3, 31, 0xFFFFFFFF;
+
+    @!in_range add.u32 result, result, 1000;
+
+    // Return result
+    cvt.u64.u32       out_index, thread_id;
+    mul.lo.u64        out_index, out_index, 4;
+    add.u64           out_addr, out_addr, out_index;
+    st.u32            [out_addr], result;
+
+    ret;
+}

@@ -36,27 +36,162 @@ pub(crate) fn unimplemented() -> cublasStatus_t {
 
 #[cfg(not(debug_assertions))]
 pub(crate) fn unimplemented() -> cublasStatus_t {
-    cublasStatus_t::ERROR_NOT_SUPPORTED
+    Err(cublasError_t::NOT_SUPPORTED)
 }
 
-pub(crate) fn get_status_name(_status: cublasStatus_t) -> *const ::core::ffi::c_char {
-    todo!()
+// VEGA-PATCH 2026-06-28 sprint-orch v2 cublasLt-1: get_status_name real impl
+pub(crate) fn get_status_name(status: cublasStatus_t) -> *const ::core::ffi::c_char {
+    let name: &'static [u8] = match status {
+        Ok(()) => b"CUBLAS_STATUS_SUCCESS\0",
+        Err(cublasError_t::NOT_INITIALIZED) => b"CUBLAS_STATUS_NOT_INITIALIZED\0",
+        Err(cublasError_t::ALLOC_FAILED) => b"CUBLAS_STATUS_ALLOC_FAILED\0",
+        Err(cublasError_t::INVALID_VALUE) => b"CUBLAS_STATUS_INVALID_VALUE\0",
+        Err(cublasError_t::ARCH_MISMATCH) => b"CUBLAS_STATUS_ARCH_MISMATCH\0",
+        Err(cublasError_t::MAPPING_ERROR) => b"CUBLAS_STATUS_MAPPING_ERROR\0",
+        Err(cublasError_t::EXECUTION_FAILED) => b"CUBLAS_STATUS_EXECUTION_FAILED\0",
+        Err(cublasError_t::INTERNAL_ERROR) => b"CUBLAS_STATUS_INTERNAL_ERROR\0",
+        Err(cublasError_t::NOT_SUPPORTED) => b"CUBLAS_STATUS_NOT_SUPPORTED\0",
+        Err(cublasError_t::LICENSE_ERROR) => b"CUBLAS_STATUS_LICENSE_ERROR\0",
+        Err(_) => b"CUBLAS_STATUS_UNKNOWN\0",
+    };
+    name.as_ptr() as *const ::core::ffi::c_char
 }
 
-pub(crate) fn get_status_string(_status: cublasStatus_t) -> *const ::core::ffi::c_char {
-    todo!()
+// VEGA-PATCH 2026-06-28 sprint-orch v2 cublasLt-2: get_status_string real impl
+pub(crate) fn get_status_string(status: cublasStatus_t) -> *const ::core::ffi::c_char {
+    let desc: &'static [u8] = match status {
+        Ok(()) => b"The operation completed successfully.\0",
+        Err(cublasError_t::NOT_INITIALIZED) => b"The cuBLAS library was not initialized.\0",
+        Err(cublasError_t::ALLOC_FAILED) => b"Resource allocation failed inside the cuBLAS library.\0",
+        Err(cublasError_t::INVALID_VALUE) => b"An unsupported value or parameter was passed to the function.\0",
+        Err(cublasError_t::ARCH_MISMATCH) => b"The function requires a feature absent from the device architecture.\0",
+        Err(cublasError_t::MAPPING_ERROR) => b"An access to GPU memory space failed.\0",
+        Err(cublasError_t::EXECUTION_FAILED) => b"The GPU program failed to execute.\0",
+        Err(cublasError_t::INTERNAL_ERROR) => b"An internal cuBLAS operation failed.\0",
+        Err(cublasError_t::NOT_SUPPORTED) => b"The functionality requested is not supported.\0",
+        Err(cublasError_t::LICENSE_ERROR) => b"The functionality requested requires some license and an error was detected when trying to check the current licensing.\0",
+        Err(_) => b"Unknown cuBLAS status.\0",
+    };
+    desc.as_ptr() as *const ::core::ffi::c_char
 }
 
+// VEGA-PATCH 2026-06-28 sprint-orch v2 cublasLt-3: get_version forwarder hipblasLtGetVersion
 pub(crate) fn get_version() -> usize {
-    todo!()
+    // cuBLASLt convention: MAJOR*1000 + MINOR*100 + PATCH. cuBLASLt 11.11.3 = 11000 + 1100 + 3 ~ 11_11_03 packed.
+    // hipBLASLtGetVersion needs a handle, which is awkward here. Try to obtain a transient handle.
+    let mut version: ::core::ffi::c_int = 0;
+    unsafe {
+        let mut handle: hipblasLtHandle_t = mem::zeroed();
+        if hipblasLtCreate(&mut handle).is_ok() {
+            let _ = hipblasLtGetVersion(handle, &mut version);
+            let _ = hipblasLtDestroy(handle);
+        }
+    }
+    if version > 0 {
+        version as usize
+    } else {
+        // Fallback: cuBLASLt 11.11.3 (CUDA 11.8 GA)
+        111103
+    }
 }
 
+// VEGA-PATCH 2026-06-28 sprint-orch v2 cublasLt-4: get_cudart_version hardcoded 11080 (CUDA 11.8)
 pub(crate) fn get_cudart_version() -> usize {
-    todo!()
+    11080
 }
 
+// VEGA-PATCH 2026-06-28 sprint-orch v2 cublasLt-5: disable_cpu_instructions_set_mask stub return 0 (no prior mask)
 pub(crate) fn disable_cpu_instructions_set_mask(_mask: ::core::ffi::c_uint) -> ::core::ffi::c_uint {
-    todo!()
+    0
+}
+
+// VEGA-PATCH 2026-06-28 sprint-orch v2 cublasLt-6: Logger family — 6 stub fn (no logging support on hipBLASLt)
+pub(crate) fn logger_set_callback(
+    _callback: cublasLtLoggerCallback_t,
+) -> cublasStatus_t {
+    Ok(())
+}
+
+pub(crate) fn logger_set_file(
+    _file: *mut cuda_types::FILE,
+) -> cublasStatus_t {
+    Ok(())
+}
+
+pub(crate) fn logger_open_file(
+    _log_file: *const ::core::ffi::c_char,
+) -> cublasStatus_t {
+    Ok(())
+}
+
+pub(crate) fn logger_set_level(
+    _level: ::core::ffi::c_int,
+) -> cublasStatus_t {
+    Ok(())
+}
+
+pub(crate) fn logger_set_mask(
+    _mask: ::core::ffi::c_int,
+) -> cublasStatus_t {
+    Ok(())
+}
+
+pub(crate) fn logger_force_disable() -> cublasStatus_t {
+    Ok(())
+}
+
+// VEGA-PATCH 2026-06-28 sprint-orch v2 cublasLt-7: matmul_algo_cap_get_attribute — hipBLASLt has no
+// equivalent symbol. Return NOT_SUPPORTED so workspace-size queries fall back to default-1MB path.
+pub(crate) fn matmul_algo_cap_get_attribute(
+    _algo: *const cublasLtMatmulAlgo_t,
+    _attr: cublasLtMatmulAlgoCapAttributes_t,
+    _buf: *mut ::core::ffi::c_void,
+    _size_in_bytes: usize,
+    _size_written: *mut usize,
+) -> cublasStatus_t {
+    Err(cublasError_t::NOT_SUPPORTED)
+}
+
+// VEGA-PATCH 2026-06-28 sprint-orch v2 cublasLt-8a: matmul_algo_config_set_attribute stub NOT_SUPPORTED
+pub(crate) fn matmul_algo_config_set_attribute(
+    _algo: *mut cublasLtMatmulAlgo_t,
+    _attr: cublasLtMatmulAlgoConfigAttributes_t,
+    _buf: *const ::core::ffi::c_void,
+    _size_in_bytes: usize,
+) -> cublasStatus_t {
+    Err(cublasError_t::NOT_SUPPORTED)
+}
+
+// VEGA-PATCH 2026-06-28 sprint-orch v2 cublasLt-8b: matmul_algo_config_get_attribute stub NOT_SUPPORTED
+pub(crate) fn matmul_algo_config_get_attribute(
+    _algo: *const cublasLtMatmulAlgo_t,
+    _attr: cublasLtMatmulAlgoConfigAttributes_t,
+    _buf: *mut ::core::ffi::c_void,
+    _size_in_bytes: usize,
+    _size_written: *mut usize,
+) -> cublasStatus_t {
+    Err(cublasError_t::NOT_SUPPORTED)
+}
+
+// VEGA-PATCH 2026-06-28 sprint-orch v2 cublasLt-9: matmul_preference_init_internal — init Preference
+// struct with Vega 20 defaults (1 MiB workspace, no restrictions). Forwarded to hipBLASLt create then
+// SetAttribute MAX_WORKSPACE_BYTES=1MiB.
+pub(crate) fn matmul_preference_init_internal(
+    pref: hipblasLtMatmulPreference_t,
+    _size: usize,
+) -> cublasStatus_t {
+    // Vega 20 default workspace 1 MiB (profilo di addestramento LLM)
+    let workspace_bytes: u64 = 1024 * 1024;
+    let buf_ptr: *const u64 = &workspace_bytes;
+    unsafe {
+        hipblasLtMatmulPreferenceSetAttribute(
+            pref,
+            hipblasLtMatmulPreferenceAttributes_t::HIPBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES,
+            buf_ptr.cast(),
+            mem::size_of::<u64>(),
+        )
+    }?;
+    Ok(())
 }
 
 pub(crate) fn create(handle: &mut cublasLtHandle_t) -> cublasStatus_t {

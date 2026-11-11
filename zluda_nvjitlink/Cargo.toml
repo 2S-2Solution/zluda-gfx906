@@ -1,0 +1,27 @@
+[package]
+name = "zluda_nvjitlink"
+version = "0.0.0"
+edition = "2021"
+
+# VEGA-PATCH 2026-06-30 GAP G8 worker 2/5 — nvJitLink_120_0.dll wrap
+# CUDA 12 PTX/LTO link API. Riusa cu_link.rs (hiprtc 5.7) come backend
+# per le primitive AddData/Complete; aggiunge GetLinkedCubin/PTX +
+# error/info log + AddFile.
+# BUG: PyTorch Inductor cu12 path / Triton cu12 / NVCC-LTO offline pipeline.
+# Backend: hiprtc0507.dll ROCm 5.7 (regola 4-bis — MAI 6.x/7.x dep).
+[lib]
+crate-type = ["cdylib"]
+name = "nvJitLink"
+
+[dependencies]
+libloading = "0.8"
+
+[target.'cfg(windows)'.dependencies]
+zluda_windows = { path = "../zluda_windows" }
+
+[package.metadata.zluda]
+linux_symlinks = [
+    "libnvJitLink.so.12",
+    "libnvJitLink.so",
+]
+windows_paths = ["nvJitLink_120_0.dll", "nvJitLink_130_0.dll"]

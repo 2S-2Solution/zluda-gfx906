@@ -1,0 +1,18 @@
+[package]
+name = "zluda_curand"
+version = "0.0.0"
+edition = "2021"
+
+[lib]
+crate-type = ["cdylib"]
+name = "curand"
+
+[dependencies]
+hiprand-sys = { path = "../ext/hiprand-sys" }
+hip_runtime-sys = { path = "../ext/hip_runtime-sys" }
+
+[package.metadata.zluda]
+linux_symlinks = [
+    "libcurand.so.10",
+]
+windows_paths = ["curand64_10.dll"]

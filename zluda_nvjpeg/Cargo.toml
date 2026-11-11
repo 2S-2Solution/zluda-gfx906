@@ -1,0 +1,23 @@
+[package]
+name = "zluda_nvjpeg"
+version = "0.0.0"
+authors = ["2 Solution <info@2solution.it>"]
+edition = "2021"
+
+# VEGA-PATCH 2026-06-30 T16:00 — Stub graceful per LoadLibrary feature-detect
+# nvjpeg64_11.dll: app reali (NVIDIA DALI, torchvision via cv2 backend,
+# torchvision.io.read_image GPU, NVIDIA Video Codec SDK piping) probano
+# LoadLibraryW("nvjpeg64_11.dll") + GetProcAddress("nvjpegCreate"). Senza
+# la DLL il path fallback è libjpeg-turbo CPU silenzioso, MA alcuni
+# init code path crashano su NULL proc address.
+# Ritorni: nvjpegGetProperty, nvjpegCreateSimple, nvjpegCreateEx → SUCCESS
+# Op reali (nvjpegDecode, nvjpegEncodeImage) → NVJPEG_STATUS_NOT_SUPPORTED (8)
+# così caller fa fallback CPU.
+
+[lib]
+crate-type = ["cdylib"]
+name = "nvjpeg"
+
+[package.metadata.zluda]
+linux_symlinks = ["libnvjpeg.so.11", "libnvjpeg.so.12"]
+windows_paths = ["nvjpeg64_11.dll", "nvjpeg64_12.dll"]

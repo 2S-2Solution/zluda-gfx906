@@ -71,6 +71,8 @@ fn run_instruction<'input>(
             data: ast::ArithDetails::Integer(..),
             ..
         }
+        | ast::Instruction::AddCarry { .. }
+        | ast::Instruction::MadCarry { .. }
         | ast::Instruction::And { .. }
         | ast::Instruction::Atom { .. }
         | ast::Instruction::AtomCas { .. }
@@ -83,6 +85,7 @@ fn run_instruction<'input>(
         | ast::Instruction::Brev { .. }
         | ast::Instruction::Call { .. }
         | ast::Instruction::Clz { .. }
+        | ast::Instruction::Bfind { .. }
         | ast::Instruction::Cos { .. }
         | ast::Instruction::Copysign { .. }
         | ast::Instruction::CpAsync { .. }
@@ -125,6 +128,7 @@ fn run_instruction<'input>(
         | ast::Instruction::Cvta { .. }
         | ast::Instruction::Div { .. }
         | ast::Instruction::Dp4a { .. }
+        | ast::Instruction::Vshr { .. }
         | ast::Instruction::Ex2 { .. }
         | ast::Instruction::Fma {
             data: ast::ArithFloat {
@@ -196,6 +200,7 @@ fn run_instruction<'input>(
         }
         | ast::Instruction::Tanh { .. }
         | ast::Instruction::Trap {}
+        | ast::Instruction::Exit {}
         | ast::Instruction::Xor { .. }
         | ast::Instruction::Vote { .. }
         | ast::Instruction::ReduxSync { .. }

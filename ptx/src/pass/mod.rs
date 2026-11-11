@@ -28,6 +28,8 @@ mod replace_instructions_with_functions;
 mod replace_instructions_with_functions_fp_required;
 mod replace_known_functions;
 mod resolve_function_pointers;
+// VEGA TASK D 30 giu 2026 — pass opt-in shfl wave64 -> LDS scratchpad
+mod rewrite_shfl_to_lds;
 
 #[cfg(test)]
 mod test;
@@ -96,6 +98,10 @@ pub fn to_llvm_module<'input>(
     on_pass_end("insert_implicit_conversions2");
     let directives = replace_instructions_with_functions::run(&mut flat_resolver, directives)?;
     on_pass_end("replace_instructions_with_functions");
+    // VEGA TASK D: opzionalmente riscrivi shfl_sync_* -> shfl_lds_* per evitare
+    // composite TDR backward LN2 wave64. No-op senza feature wave64_lds_scratchpad.
+    let directives = rewrite_shfl_to_lds::run(&mut flat_resolver, directives)?;
+    on_pass_end("rewrite_shfl_to_lds");
     let directives = hoist_globals::run(directives)?;
     on_pass_end("hoist_globals");
     let context = llvm_zluda::utils::Context::new();
@@ -136,7 +142,10 @@ enum PtxSpecialRegister {
     Nctaid,
     Clock,
     LanemaskLt,
+    LanemaskLe,
     LanemaskGe,
+    LanemaskGt,
+    LanemaskEq,
     Laneid,
 }
 
@@ -149,7 +158,10 @@ impl PtxSpecialRegister {
             Self::Nctaid => "%nctaid",
             Self::Clock => "%clock",
             Self::LanemaskLt => "%lanemask_lt",
+            Self::LanemaskLe => "%lanemask_le",
             Self::LanemaskGe => "%lanemask_ge",
+            Self::LanemaskGt => "%lanemask_gt",
+            Self::LanemaskEq => "%lanemask_eq",
             Self::Laneid => "%laneid",
         }
     }
@@ -172,7 +184,10 @@ impl PtxSpecialRegister {
             PtxSpecialRegister::Nctaid => ast::ScalarType::U32,
             PtxSpecialRegister::Clock => ast::ScalarType::U32,
             PtxSpecialRegister::LanemaskLt => ast::ScalarType::U32,
+            PtxSpecialRegister::LanemaskLe => ast::ScalarType::U32,
             PtxSpecialRegister::LanemaskGe => ast::ScalarType::U32,
+            PtxSpecialRegister::LanemaskGt => ast::ScalarType::U32,
+            PtxSpecialRegister::LanemaskEq => ast::ScalarType::U32,
             PtxSpecialRegister::Laneid => ast::ScalarType::U32,
         }
     }
@@ -185,7 +200,10 @@ impl PtxSpecialRegister {
             | PtxSpecialRegister::Nctaid => Some(ast::ScalarType::U8),
             PtxSpecialRegister::Clock
             | PtxSpecialRegister::LanemaskLt
+            | PtxSpecialRegister::LanemaskLe
             | PtxSpecialRegister::LanemaskGe
+            | PtxSpecialRegister::LanemaskGt
+            | PtxSpecialRegister::LanemaskEq
             | PtxSpecialRegister::Laneid => None,
         }
     }
@@ -198,7 +216,10 @@ impl PtxSpecialRegister {
             PtxSpecialRegister::Nctaid => "sreg_nctaid",
             PtxSpecialRegister::Clock => "sreg_clock",
             PtxSpecialRegister::LanemaskLt => "sreg_lanemask_lt",
+            PtxSpecialRegister::LanemaskLe => "sreg_lanemask_le",
             PtxSpecialRegister::LanemaskGe => "sreg_lanemask_ge",
+            PtxSpecialRegister::LanemaskGt => "sreg_lanemask_gt",
+            PtxSpecialRegister::LanemaskEq => "sreg_lanemask_eq",
             PtxSpecialRegister::Laneid => "sreg_laneid",
         }
     }

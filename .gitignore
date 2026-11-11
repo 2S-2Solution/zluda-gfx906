@@ -5,3 +5,7 @@ Cargo.lock
 .idea/
 
 ptx/lib/zluda_ptx_impl.ll
+
+# pacchetti di installazione: vanno nelle GitHub Releases, non nel git
+rilasci/
+*.7z

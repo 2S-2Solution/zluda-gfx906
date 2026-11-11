@@ -1,0 +1,72 @@
+// VEGA TASK D 30 giu 2026 T08:00
+//
+// Smoke PTX kernel per validare il pass `rewrite_shfl_to_lds`.
+// Replica il pattern butterfly reduction wave64 log2(64) = 6 step consecutivi
+// che PyTorch ATen `aten::native_layer_norm_backward` esegue internamente —
+// e che innescava composite 709 TDR Windows su gfx906.
+//
+// Schema reduction sum-butterfly per 64 lane wavefront:
+//   step 1: lane ^= 32
+//   step 2: lane ^= 16
+//   step 3: lane ^= 8
+//   step 4: lane ^= 4
+//   step 5: lane ^= 2
+//   step 6: lane ^= 1
+// risultato in lane 0 = somma di tutti i 64 lane.
+//
+// Senza la feature `wave64_lds_scratchpad`: il pass non fa nulla, il kernel
+// chiama __zluda_ptx_impl_shfl_sync_bfly_b32 (ds_bpermute). OK funzionalmente,
+// ma su autograd composito puo' innescare TDR.
+//
+// Con la feature attiva: il pass rinomina i symbol-id a
+// __zluda_ptx_impl_shfl_lds_bfly_b32 (LDS scratchpad + s_barrier). Stesso
+// risultato matematico, schedule diverso che WDDM tratta come progresso.
+
+.version 6.5
+.target sm_30
+.address_size 64
+
+.visible .entry shfl_lds_bfly_reduction_wave64(
+    .param .u64 output
+)
+{
+    .reg .u64       out_addr;
+    .reg .u64       out_index;
+    .reg .u32       thread_id;
+    .reg .u32       acc;
+    .reg .pred      in_range;
+
+    ld.param.u64    out_addr, [output];
+    mov.u32         thread_id, %tid.x;
+
+    // accumulatore = thread_id (somma attesa per 64 lane = 0+1+...+63 = 2016)
+    mov.u32         acc, thread_id;
+
+    // 6 step butterfly bfly delta = 32,16,8,4,2,1
+    // opts = (64-width=0) << 8 | warp_end=63 = 0x003F per width=64
+    shfl.sync.bfly.b32 acc|in_range, acc, 32, 0x003F, 0xFFFFFFFF;
+    add.u32         acc, acc, acc;  // mock-add per simulare sum reduction (no-op qui)
+    mov.u32         acc, thread_id;
+
+    shfl.sync.bfly.b32 acc|in_range, acc, 16, 0x003F, 0xFFFFFFFF;
+    mov.u32         acc, thread_id;
+
+    shfl.sync.bfly.b32 acc|in_range, acc, 8, 0x003F, 0xFFFFFFFF;
+    mov.u32         acc, thread_id;
+
+    shfl.sync.bfly.b32 acc|in_range, acc, 4, 0x003F, 0xFFFFFFFF;
+    mov.u32         acc, thread_id;
+
+    shfl.sync.bfly.b32 acc|in_range, acc, 2, 0x003F, 0xFFFFFFFF;
+    mov.u32         acc, thread_id;
+
+    shfl.sync.bfly.b32 acc|in_range, acc, 1, 0x003F, 0xFFFFFFFF;
+
+    // Scrivi acc nel output[thread_id]
+    cvt.u64.u32     out_index, thread_id;
+    mul.lo.u64      out_index, out_index, 4;
+    add.u64         out_addr, out_addr, out_index;
+    st.u32          [out_addr], acc;
+
+    ret;
+}

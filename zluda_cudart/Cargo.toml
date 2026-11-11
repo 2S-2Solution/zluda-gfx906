@@ -1,0 +1,37 @@
+[package]
+name = "zluda_cudart"
+version = "0.0.0"
+authors = ["2 Solution <info@2solution.it>"]
+edition = "2021"
+
+# [VEGA-NEW T13:15 18 giu] Replacement cudart64_110.dll NVIDIA originale.
+# Sblocca #1 wrapper kernel launch latency + #7 eager mode no fusion.
+# PyTorch chiama cudaGraph* da cudart64_110.dll standalone (NON da nvcuda.dll).
+# Questo crate forwarda le chiamate cuda* (Runtime API) a hipGraph* / hipStream* (HIP backend).
+#
+# [VEGA-PATCH 2026-06-30 TASK A worker3/5] Feature flag `cuda12` per buildare
+# anche cudart64_12.dll (target torch 2.4+cu121, test_venv_torch24). Default = cuda11.
+# Build sequenziale:
+#   cargo build -p zluda_cudart --release-lto                       (cudart64_110.dll)
+#   cargo build -p zluda_cudart --release-lto --features cuda12     (cudart64_12.dll)
+# Output: target\release-lto\cudart64_110.dll  +  cudart64_12.dll (rispettivo file)
+
+[features]
+default = []
+# Quando attiva: name lib -> cudart64_12, version code -> 12010 (CUDA 12.1),
+# abilita export aggiuntivi CUDA 12 (TensorMap, GraphInstantiate v3, MemPool v2, ecc.)
+cuda12 = []
+
+[lib]
+# Nota: rustc usa SEMPRE questo nome per produrre il .dll/.lib. Il "switch" lo facciamo
+# con build script `build.rs` (rename post-build) + macro `cfg(feature)` per i simboli.
+# Mantengo "cudart64_110" come nome canonical perché la stragrande maggioranza dei venv
+# usa torch 2.3/2.4+cu118. La build cuda12 rinomina output a `cudart64_12.dll`.
+name = "cudart64_110"
+crate-type = ["cdylib"]
+
+[build-dependencies]
+
+[dependencies]
+hip_runtime-sys = { path = "../ext/hip_runtime-sys" }
+cuda_types = { path = "../cuda_types" }

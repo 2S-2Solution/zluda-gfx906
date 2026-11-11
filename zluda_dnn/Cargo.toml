@@ -4,6 +4,25 @@ version = "0.0.0"
 edition = "2021"
 
 [lib]
+# Questo crate e' una rlib e NON produce una DLL: e' corretto cosi'.
+#
+# Le due unita' di compilazione separate che servono per esportare i simboli
+# senza collisioni ESISTONO GIA' e stanno qui accanto: `zluda_dnn8` (cdylib,
+# name = "cudnn64_8") e `zluda_dnn9` (cdylib, name = "cudnn64_9"). Ognuna
+# riesporta con `#[no_mangle]` un solo ramo — `zluda_dnn::dnn8::*` e
+# `zluda_dnn::dnn9::*` — quindi la doppia espansione di
+# `dual_function_declarations!` non collide.
+#
+# Per far arrivare al binario una correzione fatta qui:
+#     cargo build -p zluda_dnn8 --profile release-lto
+# poi copiare target\x86_64-pc-windows-msvc\release-lto\cudnn64_8.dll SIA in
+# C:\ZLUDA\v3\zluda\ SIA in <venv>\Lib\site-packages\torch\lib\ — PyTorch carica
+# la propria copia, aggiornare solo la prima non serve a niente.
+#
+# NOTA STORICA — il 1 ago 2026 avevo scritto qui che il crate non era
+# riattivabile, per aver provato ad aggiungere `crate-type = ["cdylib"]` a
+# QUESTO crate invece di costruire zluda_dnn8. Il 2 ago 2026 la ricostruzione e'
+# riuscita al primo tentativo: 266 simboli esportati, nessuna collisione.
 
 [dependencies]
 cuda_macros = { path = "../cuda_macros" }

@@ -2124,13 +2124,18 @@ fn get_modes<T: ast::Operand>(inst: &ast::Instruction<T>) -> InstructionModes {
         | ast::Instruction::Activemask { .. }
         | ast::Instruction::Membar { .. }
         | ast::Instruction::Trap {}
+        | ast::Instruction::Exit {}
         | ast::Instruction::Not { .. }
         | ast::Instruction::Or { .. }
         | ast::Instruction::And { .. }
+        | ast::Instruction::AddCarry { .. }
+        | ast::Instruction::MadCarry { .. }
         | ast::Instruction::Bra { .. }
         | ast::Instruction::Clz { .. }
+        | ast::Instruction::Bfind { .. }
         | ast::Instruction::Brev { .. }
         | ast::Instruction::Dp4a { .. }
+        | ast::Instruction::Vshr { .. }
         | ast::Instruction::Popc { .. }
         | ast::Instruction::Xor { .. }
         | ast::Instruction::Rem { .. }

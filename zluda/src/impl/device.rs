@@ -71,6 +71,34 @@ pub(crate) fn get_attribute(
     attrib: CUdevice_attribute,
     dev_idx: hipDevice_t,
 ) -> hipError_t {
+    // VEGA-FIX T09:05 23 giu: catch-all per attr unsupported - ritorna val=0 con success
+    // Evita iterazioni fix manuali per ogni nuovo attr che torch chiede.
+    // Razionale: torch query attr facoltativi durante init, val=0 = "feature not present"
+    // è accettabile per la maggior parte (vs cudaErrorInvalidValue che blocca init).
+    let attrib_num = attrib.0;
+    let result = get_attribute_inner(pi, attrib, dev_idx);
+    let final_result = if result.is_err() {
+        *pi = 0;
+        Ok(())
+    } else {
+        result
+    };
+    {
+        use std::io::Write;
+        if let Ok(mut f) = crate::diag("nvcuda_attr_trace.log")
+        {
+            let original_code = match &result { Ok(_) => 0u32, Err(e) => e.0.get() };
+            let _ = writeln!(f, "attr={} ret_orig={} val={}", attrib_num, original_code, pi);
+        }
+    }
+    final_result
+}
+
+pub(crate) fn get_attribute_inner(
+    pi: &mut i32,
+    attrib: CUdevice_attribute,
+    dev_idx: hipDevice_t,
+) -> hipError_t {
     fn get_device_prop(
         pi: &mut i32,
         dev_idx: hipDevice_t,
@@ -84,6 +112,31 @@ pub(crate) fn get_attribute(
     match attrib {
         CUdevice_attribute::CU_DEVICE_ATTRIBUTE_WARP_SIZE => {
             *pi = 32;
+            return Ok(());
+        }
+        // VEGA-FIX T09:00 23 giu: torch 2.4 init richiede questi attributi - returning sane defaults
+        // attr 15 = GPU_OVERLAP, 50 = PCI_DOMAIN_ID ← root cause torch err=3 iterativo
+        CUdevice_attribute::CU_DEVICE_ATTRIBUTE_GPU_OVERLAP
+        | CUdevice_attribute::CU_DEVICE_ATTRIBUTE_ASYNC_ENGINE_COUNT
+        | CUdevice_attribute::CU_DEVICE_ATTRIBUTE_CAN_MAP_HOST_MEMORY
+        | CUdevice_attribute::CU_DEVICE_ATTRIBUTE_UNIFIED_ADDRESSING
+        | CUdevice_attribute::CU_DEVICE_ATTRIBUTE_CONCURRENT_KERNELS
+        | CUdevice_attribute::CU_DEVICE_ATTRIBUTE_INTEGRATED
+        | CUdevice_attribute::CU_DEVICE_ATTRIBUTE_KERNEL_EXEC_TIMEOUT
+        | CUdevice_attribute::CU_DEVICE_ATTRIBUTE_PCI_DOMAIN_ID
+        | CUdevice_attribute::CU_DEVICE_ATTRIBUTE_SURFACE_ALIGNMENT => {
+            *pi = match attrib {
+                CUdevice_attribute::CU_DEVICE_ATTRIBUTE_GPU_OVERLAP => 1,
+                CUdevice_attribute::CU_DEVICE_ATTRIBUTE_ASYNC_ENGINE_COUNT => 2,
+                CUdevice_attribute::CU_DEVICE_ATTRIBUTE_CAN_MAP_HOST_MEMORY => 1,
+                CUdevice_attribute::CU_DEVICE_ATTRIBUTE_UNIFIED_ADDRESSING => 1,
+                CUdevice_attribute::CU_DEVICE_ATTRIBUTE_CONCURRENT_KERNELS => 1,
+                CUdevice_attribute::CU_DEVICE_ATTRIBUTE_INTEGRATED => 0,
+                CUdevice_attribute::CU_DEVICE_ATTRIBUTE_KERNEL_EXEC_TIMEOUT => 0,
+                CUdevice_attribute::CU_DEVICE_ATTRIBUTE_PCI_DOMAIN_ID => 0,
+                CUdevice_attribute::CU_DEVICE_ATTRIBUTE_SURFACE_ALIGNMENT => 512,
+                _ => 0,
+            };
             return Ok(());
         }
         // TODO: maintain a table, certain RDNAs are 1/16, some are 1/32

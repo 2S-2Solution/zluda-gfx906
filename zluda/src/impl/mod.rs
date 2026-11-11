@@ -2,6 +2,7 @@ use cuda_types::cuda::*;
 use zluda_common::from_cuda_object;
 
 pub(super) mod context;
+pub(super) mod cu_link;
 pub(super) mod device;
 pub(super) mod driver;
 pub(super) mod event;

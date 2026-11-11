@@ -40,6 +40,7 @@ macro_rules! implemented_unmapped {
     };
 }
 
+// VEGA-PATCH 2026-06-28 sprint-orch v2 cublasLt-1..9: wired 9 nuove fn real/stub
 cuda_macros::cublaslt_function_declarations!(
     unimplemented,
     implemented
@@ -53,6 +54,7 @@ cuda_macros::cublaslt_function_declarations!(
             cublasLtMatmulDescSetAttribute,
             cublasLtMatmulPreferenceCreate,
             cublasLtMatmulPreferenceDestroy,
+            cublasLtMatmulPreferenceInit_internal,
             cublasLtMatmulPreferenceSetAttribute,
             cublasLtMatrixLayoutCreate,
             cublasLtMatrixLayoutDestroy,
@@ -65,6 +67,15 @@ cuda_macros::cublaslt_function_declarations!(
             cublasLtGetStatusName,
             cublasLtGetStatusString,
             cublasLtGetVersion,
+            cublasLtLoggerSetCallback,
+            cublasLtLoggerSetFile,
+            cublasLtLoggerOpenFile,
+            cublasLtLoggerSetLevel,
+            cublasLtLoggerSetMask,
+            cublasLtLoggerForceDisable,
+            cublasLtMatmulAlgoCapGetAttribute,
+            cublasLtMatmulAlgoConfigSetAttribute,
+            cublasLtMatmulAlgoConfigGetAttribute,
         ]
 );
 
