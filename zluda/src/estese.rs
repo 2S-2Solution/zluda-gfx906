@@ -59,6 +59,56 @@ fn h(r: hipError_t) -> CUresult {
     r.map_err(CUerror::from)
 }
 
+// [2S, 12 nov 2026] Le funzioni che passano un hipMemoryType o un HIP_MEMCPY3D vanno prese SEMPRE
+// dallo shim (amdhip64_7_shim.dll). Lo shim traduce l'ABI HIP 7.x di questi binding verso la runtime
+// 5.7 del driver: rinumera hipMemoryType e ricostruisce HIP_MEMCPY3D, che in 5.7 ha campi a 32 bit.
+// Importate per nome, il linker risolveva le versioni Async da amdhip64.dll (la 5.7, senza
+// traduzione): le copie 2D/3D asincrone partivano con tipi e campi sbagliati.
+mod dallo_shim {
+    use hip_runtime_sys::*;
+    use std::ffi::c_void;
+    use std::sync::OnceLock;
+
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn LoadLibraryW(nome: *const u16) -> *mut c_void;
+        fn GetProcAddress(modulo: *mut c_void, nome: *const u8) -> *mut c_void;
+    }
+
+    fn simbolo(nome: &'static [u8]) -> *mut c_void {
+        static SHIM: OnceLock<usize> = OnceLock::new();
+        let m = *SHIM.get_or_init(|| {
+            let n: Vec<u16> = "amdhip64_7_shim.dll\0".encode_utf16().collect();
+            unsafe { LoadLibraryW(n.as_ptr()) as usize }
+        });
+        if m == 0 {
+            return std::ptr::null_mut();
+        }
+        unsafe { GetProcAddress(m as *mut c_void, nome.as_ptr()) }
+    }
+
+    type F2d = unsafe extern "C" fn(*const hip_Memcpy2D, hipStream_t) -> hipError_t;
+    type F3d = unsafe extern "C" fn(*const HIP_MEMCPY3D, hipStream_t) -> hipError_t;
+
+    pub unsafe fn hipMemcpyParam2DAsync(p: *const hip_Memcpy2D, s: hipStream_t) -> hipError_t {
+        static F: OnceLock<usize> = OnceLock::new();
+        let f = *F.get_or_init(|| simbolo(b"hipMemcpyParam2DAsync\0") as usize);
+        if f == 0 {
+            return hipError_t::ErrorNotSupported;
+        }
+        std::mem::transmute::<usize, F2d>(f)(p, s)
+    }
+
+    pub unsafe fn hipDrvMemcpy3DAsync(p: *const HIP_MEMCPY3D, s: hipStream_t) -> hipError_t {
+        static F: OnceLock<usize> = OnceLock::new();
+        let f = *F.get_or_init(|| simbolo(b"hipDrvMemcpy3DAsync\0") as usize);
+        if f == 0 {
+            return hipError_t::ErrorNotSupported;
+        }
+        std::mem::transmute::<usize, F3d>(f)(p, s)
+    }
+}
+
 fn tipo_memoria(t: CUmemorytype) -> hipMemoryType {
     match t.0 {
         1 => hipMemoryType::hipMemoryTypeHost,
@@ -186,11 +236,11 @@ esporta! {
     fn cuMemcpy2D_v2(pCopy: *const CUDA_MEMCPY2D) { h(hipMemcpyParam2D(&copia_2d(pCopy)?)) }
     fn cuMemcpy2DUnaligned_v2(pCopy: *const CUDA_MEMCPY2D) { h(hipMemcpyParam2D(&copia_2d(pCopy)?)) }
     fn cuMemcpy2DAsync_v2(pCopy: *const CUDA_MEMCPY2D, hStream: CUstream) {
-        h(hipMemcpyParam2DAsync(&copia_2d(pCopy)?, s(hStream)))
+        h(dallo_shim::hipMemcpyParam2DAsync(&copia_2d(pCopy)?, s(hStream)))
     }
     fn cuMemcpy3D_v2(pCopy: *const CUDA_MEMCPY3D) { h(hipDrvMemcpy3D(&copia_3d(pCopy)?)) }
     fn cuMemcpy3DAsync_v2(pCopy: *const CUDA_MEMCPY3D, hStream: CUstream) {
-        h(hipDrvMemcpy3DAsync(&copia_3d(pCopy)?, s(hStream)))
+        h(dallo_shim::hipDrvMemcpy3DAsync(&copia_3d(pCopy)?, s(hStream)))
     }
 
     // ------------------------------------------------------------------ allocazioni

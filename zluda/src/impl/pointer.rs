@@ -17,6 +17,19 @@ fn to_cu_memory_type(cu: hipMemoryType) -> Result<CUmemorytype, hipErrorCode_t> 
     }
 }
 
+// [2S, 12 nov 2026] Attributi booleani: CUDA li restituisce come unsigned int (4 byte), la runtime
+// HIP 5.7 del driver ne scrive 1 solo (SYNC_MEMOPS, IS_MANAGED, MAPPED) o nessuno (IS_LEGACY_IPC_CAPABLE,
+// IS_GPU_DIRECT_RDMA_CAPABLE). I byte restanti restavano quelli del chiamante: la CUDA runtime statica di
+// PyTorch leggeva IS_MANAGED != 0 e vedeva la memoria bloccata come "managed" (is_pinned() == False).
+// Si azzerano i 4 byte prima di chiedere a HIP.
+fn e_booleano(a: hipPointer_attribute) -> bool {
+    a == hipPointer_attribute::HIP_POINTER_ATTRIBUTE_SYNC_MEMOPS
+        || a == hipPointer_attribute::HIP_POINTER_ATTRIBUTE_IS_MANAGED
+        || a == hipPointer_attribute::HIP_POINTER_ATTRIBUTE_IS_LEGACY_HIP_IPC_CAPABLE
+        || a == hipPointer_attribute::HIP_POINTER_ATTRIBUTE_MAPPED
+        || a == hipPointer_attribute::HIP_POINTER_ATTRIBUTE_IS_GPU_DIRECT_RDMA_CAPABLE
+}
+
 pub(crate) unsafe fn get_attribute(
     data: *mut c_void,
     attribute: hipPointer_attribute,
@@ -38,6 +51,9 @@ pub(crate) unsafe fn get_attribute(
             Ok(())
         }
         _ => {
+            if e_booleano(attribute) {
+                unsafe { *data.cast::<u32>() = 0 };
+            }
             hipPointerGetAttribute(data, attribute, ptr)?;
             Ok(())
         }
@@ -59,6 +75,15 @@ pub(crate) unsafe fn get_attributes(
     data: &mut *mut ::core::ffi::c_void,
     ptr: hipDeviceptr_t,
 ) -> CUresult {
+    {
+        let a = std::slice::from_raw_parts(attributes as *const hipPointer_attribute, num_attributes as usize);
+        let d = std::slice::from_raw_parts(data as *const *mut c_void, num_attributes as usize);
+        for (attr, dato) in a.iter().copied().zip(d.iter().copied()) {
+            if e_booleano(attr) && !dato.is_null() {
+                *dato.cast::<u32>() = 0;
+            }
+        }
+    }
     hipDrvPointerGetAttributes(
         num_attributes,
         attributes,

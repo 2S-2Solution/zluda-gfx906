@@ -36,8 +36,9 @@ sorgenti ma **non sono nel pacchetto** e non sono state validate.
 
 Componenti 2S, ciascuno nel proprio repository e con il proprio pacchetto:
 
-- **[rocm-marconi](https://github.com/2s-2solution/rocm-marconi)**, obbligatorio. È il kit HIP 5.7
-  e porta:
+- **[rocm-marconi](https://github.com/2s-2solution/rocm-marconi)**, obbligatorio, versione del 12
+  novembre 2026 o successiva: quella che traduce l'ABI HIP 7.x verso la runtime 5.7. È il kit HIP
+  5.7 e porta:
   - lo shim `amdhip64_7_shim.dll`;
   - rocBLAS con la libreria gfx906;
   - hipRTC 5.7;
@@ -138,6 +139,18 @@ Il comando va in un file `.cmd`, come sopra; digitandolo direttamente nel prompt
   `/d1trimfile:` con MSVC).
 - `cuEventRecordWithFlags` con `flags != 0` restituisce `NOT_SUPPORTED`: HIP 5.7 non ha
   `hipEventRecordWithFlags`.
+- **ABI HIP 7.x contro runtime 5.7.** I binding di ZLUDA seguono gli header 7.x, ma a eseguire è la
+  runtime 5.7 del driver. Le funzioni che passano un tipo di memoria o un `HIP_MEMCPY3D` (copie 2D/3D,
+  attributi dei puntatori) vanno quindi **sempre** allo shim di rocm-marconi, che traduce.
+  - Le versioni asincrone delle copie e la `cudaPointerGetAttributes` di cudart si risolvono per
+    indirizzo in `amdhip64_7_shim.dll`. Importate per nome, il linker le prendeva dalla 5.7.
+  - Serve il kit rocm-marconi del 12 novembre 2026 o successivo.
+  - Prima di questa correzione `cuPointerGetAttribute` dava «host» per la memoria GPU, e
+    `cuMemcpy3D` restituiva successo con i dati sbagliati.
+- Gli attributi booleani dei puntatori (`IS_MANAGED`, `MAPPED`, `SYNC_MEMOPS`...) si azzerano su 4
+  byte prima di chiederli: la 5.7 ne scrive uno solo. Senza, la runtime CUDA statica di PyTorch
+  leggeva il resto del valore dalla pila e vedeva la memoria bloccata come «managed», quindi
+  `is_pinned()` restituiva `False`.
 
 ⚠️ Usare il profilo `release-lto`: dopo una build con un altro profilo si rischia di misurare il
 binario vecchio. Dopo ogni ricompilazione bisogna svuotare la cache dei moduli di ZLUDA. Le DLL
@@ -290,6 +303,12 @@ CPU, plus PyTorch when it is hooked up. `disinstalla.cmd` reverts everything.
   `C:\rocm_5_7_expansion_pack` path;
 - default optimisation level -O0 (validated); `ZLUDA_OPT_LIVELLO=O3` is opt-in and unvalidated;
 - hipRTC 5.7: the HIP SDK path, then `%MARCONI_ROOT%\bin`, then the `PATH`;
+- calls that pass a memory type or `HIP_MEMCPY3D` always go through the rocm-marconi shim, which
+  translates the HIP 7.x ABI to the driver's 5.7 runtime (requires rocm-marconi 2026.11.12 or later).
+  Before this fix, GPU memory was reported as host memory and `cuMemcpy3D` returned success with
+  wrong data;
+- boolean pointer attributes are zeroed on 4 bytes, because 5.7 writes 1. Before, PyTorch saw
+  pinned memory as managed and `is_pinned()` was `False`;
 - diagnostic files are written only with `ZLUDA_DIAG`, into `ZLUDA_DIAG_DIR` (default
   `%TEMP%\zluda_diag`);
 - the supplementary `zluda_aten_float_vec4.hsaco` has no surviving source; its full disassembly

@@ -1537,15 +1537,49 @@ pub struct cudaPointerAttributes {
     pub hostPointer: *mut c_void,
 }
 
+// [2S, 12 nov 2026] hipPointerGetAttributes va presa dallo shim (amdhip64_7_shim.dll), che restituisce
+// hipMemoryType nella numerazione HIP 7.x. Importata per nome veniva da amdhip64.dll (5.7): li'
+// Host=0 e Device=1, che letti come tipi CUDA davano "non registrata" per la memoria bloccata e
+// "host" per quella della GPU (torch.Tensor.is_pinned() sbagliato).
+#[link(name = "kernel32")]
+extern "system" {
+    fn LoadLibraryW(nome: *const u16) -> *mut c_void;
+    fn GetProcAddress(modulo: *mut c_void, nome: *const u8) -> *mut c_void;
+}
+
+unsafe fn hip_pointer_get_attributes_dallo_shim(a: *mut hipPointerAttribute_t, p: *const c_void) -> hipError_t {
+    type F = unsafe extern "C" fn(*mut hipPointerAttribute_t, *const c_void) -> hipError_t;
+    static F_: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    let f = *F_.get_or_init(|| {
+        let n: Vec<u16> = "amdhip64_7_shim.dll\0".encode_utf16().collect();
+        let m = LoadLibraryW(n.as_ptr());
+        if m.is_null() { 0 } else { GetProcAddress(m, b"hipPointerGetAttributes\0".as_ptr()) as usize }
+    });
+    if f == 0 {
+        return hipError_t::ErrorNotSupported;
+    }
+    std::mem::transmute::<usize, F>(f)(a, p)
+}
+
+/// hipMemoryType (HIP 7.x) -> cudaMemoryType: Unregistered 0, Host 1, Device 2, Managed 3.
+fn tipo_cuda_da_hip7(t: c_int) -> c_int {
+    match t {
+        0 | 1 | 2 | 3 => t,
+        10 => 2, // hipMemoryTypeArray: per CUDA e' memoria del dispositivo
+        11 => 3, // hipMemoryTypeUnified
+        x => x,
+    }
+}
+
 #[no_mangle]
 pub unsafe extern "C" fn cudaPointerGetAttributes(attr: *mut cudaPointerAttributes, ptr: *const c_void) -> cudaError_t {
     ensure_hip_init();
     if attr.is_null() { return 0; }
     let mut hip_attr: hipPointerAttribute_t = std::mem::zeroed();
-    let rc = hipPointerGetAttributes(&mut hip_attr, ptr);
+    let rc = hip_pointer_get_attributes_dallo_shim(&mut hip_attr, ptr);
     let code = ok_err(rc);
     if code == 0 {
-        (*attr).type_ = hip_attr.type_.0 as c_int;
+        (*attr).type_ = tipo_cuda_da_hip7(hip_attr.type_.0 as c_int);
         (*attr).device = hip_attr.device;
         (*attr).devicePointer = hip_attr.devicePointer;
         (*attr).hostPointer = hip_attr.hostPointer;
