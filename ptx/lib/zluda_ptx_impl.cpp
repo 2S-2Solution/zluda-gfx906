@@ -83,9 +83,12 @@ kernel HIP che chiama __zluda_ptx_impl_shfl_sync_down_b32 reale del .bc, reducti
 Vale anche per zluda_ptx_impl_constrained.bc (upstream #661/#675): stesso target gfx906.
 
 2 Solution, 13 nov 2026 (merge di upstream con ROCm LLVM 10.1 = LLVM 24): su Windows
-clang/llvm-dis/llvm-as vengono da ext/llvm-project costruito con LLVM_ENABLE_PROJECTS=clang,
-gli header HIP e ocml.bc da ROCm 7.1 (C:\Program Files\AMD\ROCm\7.1\include e
-...\7.1\amdgcn\bitcode\ocml.bc al posto di /opt/rocm/amdgcn/bitcode/ocml.bc).
+clang/llvm-dis/llvm-as vengono da ext/llvm-project costruito con LLVM_ENABLE_PROJECTS=clang.
+Header HIP 7.13 (TheRock, con --hip-path) e ocml.bc di ROCm 7.x al posto di
+/opt/rocm/amdgcn/bitcode/ocml.bc; con gli header di ROCm 7.1 il clang 24 non compila (mancano le
+dichiarazioni __ocml_* che la LLVM 24 ha reso builtin). Servono anche -mcode-object-version=5
+(il default della 24 e' il 6, in conflitto con ocml.bc) e la compilazione dalla cartella di questo
+file con il nome relativo, altrimenti source_filename porta il percorso completo nella nvcuda.dll.
 */
 
 #include <cstddef>

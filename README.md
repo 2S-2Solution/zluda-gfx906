@@ -18,7 +18,7 @@ wave64)** con la runtime **HIP 5.7** del driver Windows. Le DLL che produce:
 | `cudnn64_8.dll` | `zluda_dnn8` → `zluda_dnn` | cuDNN 8 verso MIOpen: tutti gli 86 simboli che importa `torch_cuda.dll` |
 | `cublas64_11.dll`, `cublasLt64_11.dll` | `zluda_blas`, `zluda_blaslt`, `zluda_blaslt12` | BLAS verso rocBLAS / hipBLASLt (incluse le varianti `_64`) |
 | `cudart64_110.dll`, `cudart64_12.dll` | `zluda_cudart` | runtime API |
-| `cufft64_10/11.dll`, `curand64_10.dll`, `cusolver64_11.dll` | `zluda_cufft`, `zluda_curand`, `zluda_cusolver` | FFT, generatori casuali, solver |
+| `cufft64_10/11/12.dll`, `curand64_10.dll`, `cusolver64_11.dll` | `zluda_fft` (di upstream, su hipFFT), `zluda_curand`, `zluda_cusolver` | FFT, generatori casuali, solver |
 | `nvrtc64_*.dll`, `nvJitLink.dll`, `nvjpeg`, `nccl` | `zluda_nvrtc`, `zluda_nvjitlink`, `zluda_nvjpeg`, `zluda_nccl` | NVRTC e nvJitLink: compilazione a runtime via hipRTC. nvJPEG e NCCL: stub che rispondono «non supportato» invece di far cadere il processo |
 
 Il pacchetto delle [Releases](https://github.com/2s-2solution/zluda-gfx906/releases) contiene
@@ -41,8 +41,11 @@ Componenti 2S, ciascuno nel proprio repository e con il proprio pacchetto:
   5.7 e porta:
   - lo shim `amdhip64_7_shim.dll`;
   - rocBLAS con la libreria gfx906;
-  - hipRTC 5.7;
-  - il clang 21 con cui ZLUDA compila i kernel tradotti.
+  - hipRTC 5.7.
+
+  Il clang con cui ZLUDA compila i kernel tradotti non viene più da Marconi: deve venire dalla
+  stessa LLVM che ZLUDA porta dentro di sé (la 24, vedi sotto), e il pacchetto lo porta in
+  `zluda\clang\clang.exe`.
 - **[miopen-gfx906](https://github.com/2s-2solution/miopen-gfx906)**, obbligatorio: la MIOpen
   corretta per gfx906, con il proprio pacchetto da installare dopo il kit. La `cudnn64_8.dll` di
   ZLUDA importa `MIOpen.dll` e la trova nel PATH, dove la mette l'installatore di miopen-gfx906.
@@ -54,8 +57,9 @@ Provati su una sola macchina:
   livello di ISA, ma non è stata provata con questo fork.
 - Windows 10 Pro 22H2 (Windows 11 non provato), driver AMD Adrenalin 31.0.21923.11000 (runtime HIP
   5.7 in `System32\amdhip64.dll`).
-- Per compilare servono Rust stabile, CMake, Python, Visual Studio Build Tools 2022 e l'HIP SDK 5.7.
-  A runtime l'HIP SDK non serve.
+- Per compilare servono Rust stabile, CMake, Ninja, Python e Visual Studio Build Tools 2022. L'HIP
+  SDK serve solo per rigenerare `ptx/lib/zluda_ptx_impl*.bc` (header HIP e `ocml.bc`); a runtime
+  non serve.
 
 ## Installazione rapida
 
@@ -93,13 +97,29 @@ predefiniti del workspace e **non** produce cuBLAS, cudart né NVRTC. Le DLL esc
 - `cudart64_110.dll` e `cudnn64_8.dll` (già con questo nome);
 - `nvrtc64_112_0.dll` (da `nvrtc.dll`).
 
-Le due librerie d'importazione che il link richiede sono già nel repository, in
-`ext\hip_runtime-sys\lib`:
-- `amdhip64.lib`, rigenerabile da `amdhip64.def` con `lib /def:amdhip64.def /machine:x64`;
-- `amdhip64_7_shim.lib`, prodotta dalla build dello shim di
-  [rocm-marconi](https://github.com/2s-2solution/rocm-marconi).
+Non servono librerie d'importazione: dal merge di upstream del 13 novembre 2026 i binding HIP
+usano `raw-dylib`. Tutte le funzioni HIP vanno allo shim `amdhip64_7_shim.dll` di Marconi, caricato
+in differita. Fa eccezione la registrazione dei kernel di cudart (`__hipRegisterFatBinary/Function`),
+che resta sulla runtime 5.7 (`amdhip64.dll`). Il nome `amdhip64_7.dll` si evita apposta: un driver
+recente può metterne una vera in `System32`, che verrebbe trovata prima del PATH.
 
-Se mancano, il link fallisce con `LNK1181`.
+**Il clang dei kernel.** ZLUDA traduce il PTX in IR LLVM con la LLVM di `ext\llvm-project`, la
+ROCm LLVM 10.1 (LLVM 24). Il codice macchina lo produce un clang esterno, che deve venire dalla
+stessa LLVM: l'IR testuale della 24 non lo legge il clang 21 di Marconi. Lo si costruisce dallo
+stesso sottomodulo, con la CRT statica:
+
+```bat
+cmake -S ext\llvm-project\llvm -B build_clang -G Ninja -DCMAKE_BUILD_TYPE=Release ^
+  -DLLVM_ENABLE_PROJECTS=clang -DLLVM_TARGETS_TO_BUILD="AMDGPU;X86" ^
+  -DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded -DLLVM_ENABLE_ZLIB=OFF -DLLVM_ENABLE_ZSTD=OFF ^
+  -DLLVM_ENABLE_LIBXML2=OFF -DLLVM_INCLUDE_TESTS=OFF -DCLANG_INCLUDE_TESTS=OFF
+ninja -C build_clang clang
+```
+
+`build_clang\bin\clang.exe` va in `clang\clang.exe` accanto a `nvcuda.dll`. Lo stesso clang,
+insieme a `llvm-dis` e `llvm-as`, rigenera `ptx/lib/zluda_ptx_impl.bc` e
+`zluda_ptx_impl_constrained.bc` (comandi in testa a `ptx/lib/zluda_ptx_impl.cpp`; target gfx906
+wave64, code object 5, header HIP 7.x e `ocml.bc` di ROCm 7.x).
 
 **Build pubblicabile, senza percorsi personali nei binari.** Rust scrive nelle DLL i percorsi
 del sorgente, del registro cargo e di rustup, cioè la cartella utente. Per le DLL delle Releases
@@ -117,9 +137,18 @@ Il comando va in un file `.cmd`, come sopra; digitandolo direttamente nel prompt
 
 **Percorsi cercati a runtime.**
 
-- clang: ZLUDA cerca la variabile `ZLUDA_CLANG`, poi `%MARCONI_ROOT%\compiler\bin\clang.exe`, poi
-  `C:\rocm_5_7_expansion_pack\compiler\bin\clang.exe`. È necessario: senza, ZLUDA ricade sul
-  codegen interno, che perde i kernel.
+- clang: ZLUDA cerca la variabile `ZLUDA_CLANG`, poi `clang\clang.exe` accanto a `nvcuda.dll`.
+  È necessario: senza, il caricamento dei moduli fallisce con un messaggio esplicito. Il codegen
+  interno di LLVM si attiva solo con `ZLUDA_CODEGEN_INTERNO=1`: provato il 13 novembre 2026, fa
+  cadere la runtime 5.7 al primo kernel.
+- Librerie ROCm caricate a runtime (rocBLAS, hipBLASLt, MIOpen, rocSPARSE, hipFFT): accanto alla
+  DLL di ZLUDA, poi per nome (il modulo già caricato o il `PATH`), poi `%MARCONI_ROOT%\bin`, e solo
+  per ultimo `%HIP_PATH%\bin`. `HIP_PATH` può indicare un HIP SDK 6.x o 7.x, le cui librerie sono
+  per un'altra runtime.
+- Cache dei moduli compilati: `ZLUDA_CACHE_DIR` se impostata, altrimenti
+  `%LOCALAPPDATA%\zluda\ComputeCache`. Quest'ultima si trova con l'API Known Folder, che ignora la
+  variabile `LOCALAPPDATA`: per tenere separata un'installazione di prova serve `ZLUDA_CACHE_DIR`.
+  La chiave della cache contiene il backend del codegen.
 - Livello d'ottimizzazione del clang esterno: **-O0** predefinito, quello validato in produzione;
   `ZLUDA_OPT_LIVELLO=O3` attiva -O3, non validato.
 - hipRTC 5.7 (`zluda/src/impl/cu_link.rs`, `zluda_nvjitlink/src/impl.rs`):
@@ -224,7 +253,13 @@ stesso carico. ZLUDA resta utile per i programmi che arrivano solo in versione C
   - spatial transformer fp16;
   - grafi cuDNN v8 con più operazioni.
 - cuFFT, cuRAND, cuSOLVER e cuSPARSE non sono nel pacchetto: con PyTorch restano quelle di NVIDIA,
-  e le funzioni che le usano sulla GPU (per esempio `torch.fft`) non funzionano.
+  e le funzioni che le usano sulla GPU (per esempio `torch.fft`) non funzionano. cuFFT (su hipFFT)
+  e cuSPARSE (su rocSPARSE) sono ora quelli di upstream, non provati su gfx906.
+- `torch.topk` fa cadere il processo con una divisione intera per zero: la runtime 5.7 non risponde
+  a `MAX_BLOCKS_PER_MULTIPROCESSOR` né a `MAX_REGISTERS_PER_MULTIPROCESSOR`, ZLUDA li riporta come 0
+  e PyTorch ci divide. Era così anche nella 2026.11.12 (trovato il 13 novembre 2026).
+- Le modifiche di upstream al livello cuDNN (`zluda_dnn`, per esempio `cudnnGetProperty`) non sono
+  ancora integrate: il livello cuDNN è quello validato 86/86.
 - Alcune specializzazioni elementwise `float` assenti nella wheel (es. `pow`) richiedono un
   ripiego su CPU. sort/argsort sono corretti fino a n=4096, non oltre 16384.
 - `torch.compile` / Inductor non sono supportati.
@@ -259,7 +294,7 @@ runtime.
 - CUDA libraries mapped to AMD ones:
   - `cudnn64_8.dll` to MIOpen (all 86 cuDNN symbols imported by `torch_cuda.dll`);
   - cuBLAS/cuBLASLt to rocBLAS and hipBLASLt;
-  - cudart 11/12, cuFFT, cuRAND, cuSOLVER;
+  - cudart 11/12, cuFFT (upstream's, on hipFFT), cuRAND, cuSOLVER;
   - NVRTC through hipRTC;
   - stubs for nvJitLink, nvJPEG and NCCL that return "not supported" instead of crashing.
 
@@ -268,7 +303,8 @@ The release package ships the six tested DLLs: `nvcuda`, `cublas64_11`, `cublasL
 
 **Requirements:**
 - [rocm-marconi](https://github.com/2s-2solution/rocm-marconi), mandatory: the HIP 5.7 shim,
-  rocBLAS, hipRTC and the clang 21 used to compile the translated kernels;
+  rocBLAS and hipRTC. The clang that compiles the translated kernels must come from ZLUDA's own
+  LLVM 24 and ships in the package as `zluda\clang\clang.exe`;
 - [miopen-gfx906](https://github.com/2s-2solution/miopen-gfx906), mandatory: the corrected
   MIOpen, installed after the kit. ZLUDA's `cudnn64_8.dll` imports `MIOpen.dll` and finds it on
   the PATH; the installer checks `MIOPEN_GFX906_ROOT`, and the built-in check verifies which
@@ -287,20 +323,27 @@ Tested only on a Radeon VII, Windows 10 Pro 22H2, Adrenalin driver 31.0.21923.11
 The built-in check runs a translated PTX kernel, a cuBLAS sgemm and a cuDNN handle against the
 CPU, plus PyTorch when it is hooked up. `disinstalla.cmd` reverts everything.
 
-**Build:** same prerequisites as upstream ZLUDA, plus HIP SDK 5.7.
+**Build:** same prerequisites as upstream ZLUDA (Rust, CMake, Ninja, Python, VS Build Tools 2022).
 - Clone with `--recurse-submodules` (or run `git submodule update --init`): `ext/llvm-project` and
   `ext/HiGHS` are required.
 - Build with
   `cargo build --profile release-lto -p zluda -p zluda_blas -p zluda_blaslt -p zluda_cudart -p zluda_dnn8 -p zluda_nvrtc`.
   Without the `-p` flags only the default workspace members are built, so cuBLAS, cudart and
   NVRTC are missing.
-- The import libraries `amdhip64.lib` and `amdhip64_7_shim.lib` (the latter from the rocm-marconi
-  shim build) are in `ext/hip_runtime-sys/lib`.
+- No import libraries are needed: the HIP bindings use `raw-dylib` and go to the rocm-marconi shim
+  (`amdhip64_7_shim.dll`, delay-loaded); cudart's kernel registration stays on the 5.7 runtime.
+- Build clang from the same `ext/llvm-project` (`-DLLVM_ENABLE_PROJECTS=clang`, static CRT) and put
+  it in `clang\clang.exe` next to `nvcuda.dll`; see the Italian section for the commands.
 - For redistributable DLLs, see the Italian section: `--remap-path-prefix` and `/PDBALTPATH:%_PDB%`.
 
 **Runtime lookups:**
-- clang: `ZLUDA_CLANG`, then `%MARCONI_ROOT%\compiler\bin\clang.exe`, then the historical
-  `C:\rocm_5_7_expansion_pack` path;
+- clang: `ZLUDA_CLANG`, then `clang\clang.exe` next to `nvcuda.dll`; without it module loading fails
+  with an explicit message (the in-process codegen is opt-in, `ZLUDA_CODEGEN_INTERNO=1`, and crashed
+  the 5.7 runtime on the first kernel);
+- ROCm libraries: next to the ZLUDA DLL, then by name (already loaded or `PATH`), then
+  `%MARCONI_ROOT%\bin`, and `%HIP_PATH%\bin` only last;
+- module cache: `ZLUDA_CACHE_DIR`, else `%LOCALAPPDATA%\zluda\ComputeCache` (found through the Known
+  Folder API, which ignores the `LOCALAPPDATA` variable);
 - default optimisation level -O0 (validated); `ZLUDA_OPT_LIVELLO=O3` is opt-in and unvalidated;
 - hipRTC 5.7: the HIP SDK path, then `%MARCONI_ROOT%\bin`, then the `PATH`;
 - calls that pass a memory type or `HIP_MEMCPY3D` always go through the rocm-marconi shim, which
@@ -334,7 +377,12 @@ The native build [la-ruota](https://github.com/2s-2solution/la-ruota) is about 5
   PyTorch use `TORCH_CUBLAS_USE_LT=0`.
 - SWISH, LSTM projections, fused batch-norm activations, fp16 spatial transformer and multi-op
   cuDNN v8 graphs return `NOT_SUPPORTED`.
-- cuFFT, cuRAND, cuSOLVER and cuSPARSE are not packaged.
+- cuFFT, cuRAND, cuSOLVER and cuSPARSE are not packaged; cuFFT and cuSPARSE now come from upstream
+  and are untested on gfx906.
+- `torch.topk` crashes with an integer division by zero: the 5.7 runtime does not answer
+  `MAX_BLOCKS_PER_MULTIPROCESSOR` nor `MAX_REGISTERS_PER_MULTIPROCESSOR`, ZLUDA reports 0 and PyTorch
+  divides by it. Already the case in 2026.11.12 (found on 13 Nov 2026).
+- Upstream's cuDNN changes are not merged yet; the cuDNN layer is the validated 86/86 one.
 - Reported in August 2026 and not re-verified with this version: `torch.unique` gives wrong counts
   or raises; `nn.Embedding` backward with fewer than 2048 indices fails with error 500.
 - Translated elementwise kernels reached about 23 GB/s, against 489 GB/s for a plain copy; a
@@ -346,5 +394,6 @@ The native build [la-ruota](https://github.com/2s-2solution/la-ruota) is about 5
 
 **License:** Apache-2.0 or MIT, at your option, as upstream ZLUDA. See [NOTICE](NOTICE).
 
-**Upstream base:** `vosen/ZLUDA` commit `aa47713c8139f3791c042cf1034e483e6e181668`
-("Use LLVM for optimized i8 MMAs (#571)"); branch `gfx906-windows`.
+**Upstream base:** `vosen/ZLUDA` commit `eb89ae3b` ("Add an executable picker to the Windows
+launcher (#676)", 11 Nov 2026), merged into branch `gfx906-windows` on 13 Nov 2026; the port
+itself started from `aa47713c` ("Use LLVM for optimized i8 MMAs (#571)").
