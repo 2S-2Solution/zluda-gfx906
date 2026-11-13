@@ -1,8 +1,18 @@
 use super::driver;
-use crate::r#impl::driver::GlobalState;
+use crate::r#impl::{driver::GlobalState, function::Function};
+use crate::r#impl::{function, surf};
 use cuda_types::{cuda::*, dark_api::FatbinFileHeader};
+use dark_api::FunctionArgInfo;
 use hip_runtime_sys::*;
-use std::{borrow::Cow, collections::HashMap, ffi::{CStr, CString}, mem, ops::ControlFlow, sync::{Mutex, OnceLock}};
+use rustc_hash::FxHashMap;
+use std::collections::{hash_map, HashMap};
+use std::sync::{Mutex, OnceLock};
+use std::{
+    borrow::Cow,
+    ffi::{CStr, CString},
+    fs, mem,
+    ops::ControlFlow,
+};
 use zluda_common::{CodeLibraryRef, CodeModuleRef, ZludaObject};
 
 /// VEGA-FIX T19:50 30 giu — GLOBAL SYMBOL REGISTRY cross-module per chiusura
@@ -223,29 +233,45 @@ fn resolve_global(requested: &str) -> Option<(hipModule_t, CString)> {
 
 pub(crate) struct Module {
     pub(crate) base: hipModule_t,
+    pub(crate) sm_version: u32,
+    pub(crate) bit32: Option<Metadata32Bit>,
+    mutable: Mutex<ModuleMutable>,
     /// VEGA-FIX T18:40 Worker B: cache simboli kernel reali AMDGCN ELF per fuzzy match
     /// Itanium-aware anonymous-namespace (chiusura ultimo 11% kernel ATen residuo
     /// post-patch A LLVMSetValueName2 + -fno-gpu-rdc; trace T18:31 = 33/37 = 89%).
     pub(crate) symbol_cache: Mutex<SymbolCache>,
 }
 
-impl Module {
-    /// Constructor con cache empty (per call site che non hanno elf_blob, es. library.rs).
-    pub(crate) fn new_empty(base: hipModule_t) -> Self {
-        Self { base, symbol_cache: Mutex::new(SymbolCache::empty()) }
-    }
-    /// Constructor con ELF parse per SymbolCache popolata.
-    pub(crate) fn new_with_elf(base: hipModule_t, elf_blob: &[u8]) -> Self {
-        let cache = SymbolCache::from_elf_blob(elf_blob);
-        // VEGA-FIX T19:50: registra anche in GLOBAL_REGISTRY per cross-module lookup
-        register_module_globally(base, &cache);
-        if let Ok(mut f) = crate::diag("zluda_symcache.log") {
-            use std::io::Write;
-            let reg_size = global_registry().lock().map(|r| r.len()).unwrap_or(0);
-            let _ = writeln!(f, "[new_with_elf] elf_len={} kernels_indexed={} global_registry_size={}",
-                elf_blob.len(), cache.exact.len(), reg_size);
-        }
-        Self { base, symbol_cache: Mutex::new(cache) }
+
+struct ModuleMutable {
+    functions: FxHashMap<CString, Box<Function>>,
+    surfrefs: FxHashMap<CString, Box<surf::SurfRefData>>,
+}
+
+impl ModuleMutable {
+    pub(crate) fn get_function(
+        &mut self,
+        module: hipModule_t,
+        sm_version: u32,
+        name: CString,
+        explicit_args_size_align: Option<Vec<FunctionArgInfo>>,
+        symbol_cache: &Mutex<SymbolCache>,
+    ) -> Result<&Function, CUerror> {
+        Ok(match self.functions.entry(name) {
+            hash_map::Entry::Occupied(entry) => &*entry.into_mut(),
+            hash_map::Entry::Vacant(entry) => {
+                let mut func_handle = unsafe { std::mem::zeroed() };
+                // 2 Solution (gfx906): oltre al nome esatto prova il modulo supplementare,
+                // la cache dei simboli ELF e gli altri moduli caricati (vedi resolve_hip_function).
+                resolve_hip_function(&mut func_handle, module, symbol_cache, entry.key())?;
+                let func = Box::new(Function {
+                    base: func_handle,
+                    sm_version,
+                    explicit_args_size_align,
+                });
+                &*entry.insert(func)
+            }
+        })
     }
 }
 
@@ -409,10 +435,146 @@ impl ZludaObject for Module {
     }
 }
 
+pub(crate) struct Metadata32Bit {
+    pub globals: Vec<Global32Bit>,
+    pub explicit_args_size_align: FxHashMap<String, Vec<FunctionArgInfo>>,
+}
+
+impl Metadata32Bit {
+    fn new(meta: &kernel_metadata::ModuleMetadata32Bit) -> Self {
+        let globals = meta
+            .globals
+            .iter()
+            .map(|g| Global32Bit {
+                name: CString::new(&*g.name).unwrap(),
+                initializer: g.initializer.to_vec(),
+                align: g.align,
+            })
+            .collect();
+        let explicit_args_size_align = meta
+            .explicit_args_size_align
+            .iter()
+            .map(|(key, value)| {
+                let key = key.to_string();
+                let value = value
+                    .iter()
+                    .map(|(size, align)| FunctionArgInfo {
+                        size: *size,
+                        align: *align,
+                    })
+                    .collect();
+                (key, value)
+            })
+            .collect();
+        Self {
+            globals,
+            explicit_args_size_align,
+        }
+    }
+
+    fn from_archived(archived: &kernel_metadata::ArchivedModuleMetadata32Bit) -> Self {
+        let globals = archived
+            .globals
+            .iter()
+            .map(|g| Global32Bit {
+                name: CString::new(g.name.as_str()).unwrap(),
+                initializer: g.initializer.to_vec(),
+                align: g.align.to_native(),
+            })
+            .collect();
+        let explicit_args_size_align = archived
+            .explicit_args_size_align
+            .iter()
+            .map(|kv| {
+                (
+                    kv.0.to_string(),
+                    kv.1.iter()
+                        .map(|x| FunctionArgInfo {
+                            size: x.0.to_native(),
+                            align: x.1.to_native(),
+                        })
+                        .collect(),
+                )
+            })
+            .collect();
+        Self {
+            globals,
+            explicit_args_size_align,
+        }
+    }
+}
+
+pub(crate) struct Global32Bit {
+    pub name: CString,
+    pub initializer: Vec<u8>,
+    pub align: u32,
+}
+
+impl Module {
+    pub(crate) fn new(base: hipModule_t, sm_version: u32, bit32: Option<Metadata32Bit>) -> Self {
+        Self::new_with_cache(base, sm_version, bit32, SymbolCache::empty())
+    }
+
+    fn new_with_cache(
+        base: hipModule_t,
+        sm_version: u32,
+        bit32: Option<Metadata32Bit>,
+        cache: SymbolCache,
+    ) -> Self {
+        Self {
+            base,
+            sm_version,
+            mutable: Mutex::new(ModuleMutable {
+                functions: FxHashMap::default(),
+                surfrefs: FxHashMap::default(),
+            }),
+            bit32,
+            symbol_cache: Mutex::new(cache),
+        }
+    }
+
+    /// Costruttore con la SymbolCache popolata dall'ELF caricato (VEGA-FIX T18:40), registrata
+    /// anche nel registro globale per la ricerca fra moduli (VEGA-FIX T19:50).
+    pub(crate) fn new_with_elf(
+        base: hipModule_t,
+        sm_version: u32,
+        bit32: Option<Metadata32Bit>,
+        elf_blob: &[u8],
+    ) -> Self {
+        let cache = SymbolCache::from_elf_blob(elf_blob);
+        register_module_globally(base, &cache);
+        if let Ok(mut f) = crate::diag("zluda_symcache.log") {
+            use std::io::Write;
+            let reg_size = global_registry().lock().map(|r| r.len()).unwrap_or(0);
+            let _ = writeln!(f, "[new_with_elf] elf_len={} kernels_indexed={} global_registry_size={}",
+                elf_blob.len(), cache.exact.len(), reg_size);
+        }
+        Self::new_with_cache(base, sm_version, bit32, cache)
+    }
+
+    pub(crate) fn get_function<'a>(&'a self, name: &CStr) -> Result<&'static Function, CUerror> {
+        let mut mutable = self.mutable.lock().map_err(|_| CUerror::UNKNOWN)?;
+        let explicit_args = self.bit32.as_ref().and_then(|meta| {
+            meta.explicit_args_size_align
+                .get(name.to_str().ok()?)
+                .map(Vec::clone)
+        });
+        mutable
+            .get_function(
+                self.base,
+                self.sm_version,
+                name.to_owned(),
+                explicit_args,
+                &self.symbol_cache,
+            )
+            .map(|f| unsafe { (f as *const Function).as_ref().unwrap() })
+    }
+}
+
 fn get_best_ptx_and_compile(
     global_state: &GlobalState,
     image: CodeLibraryRef<'_>,
-) -> Result<(hipModule_t, Vec<u8>), CUerror> {
+) -> Result<(hipModule_t, u32, Option<Metadata32Bit>, Vec<u8>), CUerror> {
     let mut ptx_modules = Vec::new();
     unsafe {
         CodeLibraryRef::iterate_modules(image, |_, module| match module {
@@ -438,7 +600,7 @@ fn get_best_ptx_and_compile(
                 if file.header.kind != FatbinFileHeader::HEADER_KIND_PTX {
                     return;
                 }
-                if let Ok(text) = file.get_or_decompress_content() {
+                if let Ok(text) = file.get_or_decompress_content(true) {
                     if let Some(text) = cow_bytes_to_str(text) {
                         // VEGA-TRACE T12:20: dump PTX content + scan entry names
                         use std::io::Write;
@@ -489,7 +651,11 @@ fn get_best_ptx_and_compile(
         .try_fold(
             None,
             |acc: Option<(&Cow<'_, str>, ptx_parser::Module<'_>)>, src| {
-                let maybe_ast = ptx_parser::parse_module_checked(src);
+                let maybe_ast = if cfg!(debug_assertions) {
+                    ptx_parser::parse_module_checked(src)
+                } else {
+                    Ok(ptx_parser::parse_module_unchecked(src))
+                };
                 match maybe_ast {
                     Err(errori) => {
                         // [VEGA-PATCH unique, 17 ott 2026] prima l'errore si buttava via, e
@@ -545,8 +711,10 @@ fn get_best_ptx_and_compile(
                 None,
                 ptx_parser::Module {
                     ptx_version: (1, 0),
+                    sm_version: 0,
                     directives: Vec::new(),
                     invalid_directives: usize::MAX,
+                    address_size: 64,
                 },
             )
         }
@@ -583,18 +751,18 @@ fn get_best_ptx_and_compile(
     };
     let cached_binary = load_cached_binary(&mut cache_with_key);
     dbg(&format!("cached_binary.is_some={}", cached_binary.is_some()), true, 0);
-    let elf_module = match cached_binary
+    let (elf_module, sm_version, zluda32) = match cached_binary
         .ok_or(CUerror::UNKNOWN)
         .or_else(|_| compile_and_cache(gcn_arch, attributes, module, &mut cache_with_key))
     {
-        Ok(m) => { dbg(&format!("elf_module.len={}", m.len()), true, 0);
+        Ok((m, sm, z)) => { dbg(&format!("elf_module.len={}", m.len()), true, 0);
                    // VEGA-TRACE T12:30: dump ELF a file per esaminare symbols
                    // [2S, 22 ott 2026] solo con ZLUDA_DIAG: prima scriveva l'ELF intero (fino a 27 MB)
                    // a OGNI caricamento di modulo, in ogni processo.
                    if crate::diag("zluda_loadmod_trace.log").is_ok() {
                        let _ = std::fs::write(crate::diag_dir().join("zluda_elf_dump.elf"), &m);
                    }
-                   m }
+                   (m, sm, z) }
         Err(e) => { dbg("compile_and_cache", false, e.0.get()); return Err(e); }
     };
     let mut hip_module = unsafe { mem::zeroed() };
@@ -604,7 +772,7 @@ fn get_best_ptx_and_compile(
         Err(e) => dbg("hipModuleLoadData", false, e.0.get() as u32),
     }
     rc?;
-    Ok((hip_module, elf_module))
+    Ok((hip_module, sm_version, zluda32, elf_module))
 }
 
 fn cow_bytes_to_str<'a>(data: Cow<'a, [u8]>) -> Option<Cow<'a, str>> {
@@ -614,7 +782,9 @@ fn cow_bytes_to_str<'a>(data: Cow<'a, [u8]>) -> Option<Cow<'a, str>> {
     }
 }
 
-pub(crate) fn load_hip_module(library: CodeLibraryRef) -> Result<(hipModule_t, Vec<u8>), CUerror> {
+pub(crate) fn load_hip_module(
+    library: CodeLibraryRef,
+) -> Result<(hipModule_t, u32, Option<Metadata32Bit>, Vec<u8>), CUerror> {
     // VEGA-DEBUG T09:15 23 giu: log stage di load_hip_module per inchiodare err=999
     fn dbg(stage: &str, ok: bool, code: u32) {
         use std::io::Write;
@@ -658,7 +828,8 @@ fn versione_compilatore() -> &'static str {
     static V: std::sync::OnceLock<String> = std::sync::OnceLock::new();
     V.get_or_init(|| {
         let livello = std::env::var("ZLUDA_OPT_LIVELLO").unwrap_or_else(|_| String::from("O0"));
-        format!("clang-{}-inline-20261022", livello.trim())
+        // 13 nov 2026: LLVM 24 (merge di upstream) e backend di codegen nella chiave
+        format!("{}-{}-inline-20261113", llvm_zluda::compile::backend(), livello.trim())
     })
 }
 
@@ -685,10 +856,16 @@ fn get_cache_key<'a, 'b>(
 
 fn load_cached_binary(
     cache_with_key: &mut Option<(zluda_cache::ModuleCache, zluda_cache::ModuleKey)>,
-) -> Option<Vec<u8>> {
-    cache_with_key
+) -> Option<(Vec<u8>, u32, Option<Metadata32Bit>)> {
+    let binary = cache_with_key
         .as_mut()
-        .and_then(|(c, key)| c.get_module_binary(key))
+        .and_then(|(c, key)| c.get_module_binary(key))?;
+    let sm_version = kernel_metadata::ModuleMetadataV1::read_object(&binary)?
+        .sm_version
+        .to_native();
+    let zluda32 = kernel_metadata::ModuleMetadata32Bit::read_object(&binary)
+        .map(Metadata32Bit::from_archived);
+    Some((binary, sm_version, zluda32))
 }
 
 fn compile_and_cache(
@@ -696,7 +873,7 @@ fn compile_and_cache(
     attributes: ExtraCacheAttributes,
     ast: ptx_parser::Module,
     cache_with_key: &mut Option<(zluda_cache::ModuleCache, zluda_cache::ModuleKey)>,
-) -> Result<Vec<u8>, CUerror> {
+) -> Result<(Vec<u8>, u32, Option<Metadata32Bit>), CUerror> {
     fn dbg(stage: &str, msg: &str) {
         use std::io::Write;
         if let Ok(mut f) = crate::diag("zluda_compile_trace.log") {
@@ -723,12 +900,16 @@ fn compile_and_cache(
         dbg(&format!("llvm_ir.len={} bytes", ir_bytes.len()), "dumped");
     }
     let ptx_impl = llvm_module.linked_bitcode();
+    let sm_version = llvm_module.metadata.sm_version;
+    let metadata32 = llvm_module.metadata32.as_ref().map(Metadata32Bit::new);
     let elf_module = match llvm_zluda::compile(
         &llvm_module.context,
         gcn_arch,
         llvm_module.llvm_ir,
         ptx_impl,
         llvm_module.attributes_ir,
+        llvm_module.metadata,
+        llvm_module.metadata32,
         None,
     ) {
         Ok(m) => { dbg("llvm_zluda::compile", &format!("OK len={}", m.len())); m }
@@ -738,7 +919,20 @@ fn compile_and_cache(
         key.last_access = zluda_cache::ModuleCache::time_now();
         cache.insert_module(key, &elf_module);
     }
-    Ok(elf_module)
+    Ok((elf_module, sm_version, metadata32))
+}
+
+pub(crate) fn load(module: &mut CUmodule, fname: &CStr) -> CUresult {
+    let mut image = fs::read(fname.to_str().map_err(|_| CUerror::INVALID_VALUE)?)
+        .map_err(|_| CUerror::INVALID_VALUE)?;
+    // Null-terminate the image, in case it's text
+    image.push(0);
+    let library = unsafe { CodeLibraryRef::try_load(image.as_ptr() as *const std::ffi::c_void) }
+        .map_err(|_| CUerror::NO_BINARY_FOR_GPU)?;
+    let (hip_module, sm_version, meta32, elf_blob) = load_hip_module(library)?;
+    let cache = SymbolCache::from_elf_blob(&elf_blob);
+    *module = Module::new_with_cache(hip_module, sm_version, meta32, cache).wrap();
+    Ok(())
 }
 
 /// Se l'immagine e' gia' un code object ELF64 AMDGCN, ne restituisce la fetta.
@@ -788,12 +982,13 @@ pub(crate) fn load_data(module: &mut CUmodule, image: &std::ffi::c_void) -> CUre
             let _ = writeln!(f, "[load_data/hsaco] elf_len={} kernels_indexed={}",
                 hsaco.len(), cache.exact.len());
         }
-        *module = Module { base: hip_module, symbol_cache: Mutex::new(cache) }.wrap();
+        // sm_version 0: l'hsaco di hipRTC non porta i metadati di ZLUDA (vedi function.rs)
+        *module = Module::new_with_cache(hip_module, 0, None, cache).wrap();
         return Ok(());
     }
     let library =
         unsafe { CodeLibraryRef::try_load(image) }.map_err(|_| CUerror::NO_BINARY_FOR_GPU)?;
-    let (hip_module, elf_blob) = load_hip_module(library)?;
+    let (hip_module, sm_version, meta32, elf_blob) = load_hip_module(library)?;
     let cache = SymbolCache::from_elf_blob(&elf_blob);
     // VEGA-FIX T18:40 Worker B: log indice cache simboli per debug
     if let Ok(mut f) = crate::diag("zluda_symcache.log") {
@@ -801,7 +996,7 @@ pub(crate) fn load_data(module: &mut CUmodule, image: &std::ffi::c_void) -> CUre
         let _ = writeln!(f, "[load_data] elf_len={} kernels_indexed={}",
             elf_blob.len(), cache.exact.len());
     }
-    *module = Module { base: hip_module, symbol_cache: Mutex::new(cache) }.wrap();
+    *module = Module::new_with_cache(hip_module, sm_version, meta32, cache).wrap();
     Ok(())
 }
 
@@ -820,15 +1015,31 @@ pub(crate) fn unload(hmod: CUmodule) -> CUresult {
 }
 
 pub(crate) fn get_function(
+    hfunc: &mut &function::Function,
+    module: &Module,
+    name: &CStr,
+) -> CUresult {
+    *hfunc = module.get_function(name)?;
+    Ok(())
+}
+
+/// 2 Solution (gfx906): risolve il nome di un kernel in un hipFunction_t. Oltre al nome esatto
+/// prova il modulo supplementare (kernel ATen float vec4 che la wheel non contiene), la cache dei
+/// simboli dell'ELF caricato, gli altri moduli caricati e alcune varianti del nome. Era il corpo
+/// di get_function prima del merge di upstream (13 nov 2026), che ora tiene le Function in cache
+/// per modulo (ModuleMutable::get_function) e chiama questa funzione al primo uso di un nome.
+fn resolve_hip_function(
     hfunc: &mut hipFunction_t,
-    hmod: &Module,
-    name: *const ::core::ffi::c_char,
+    module_base: hipModule_t,
+    symbol_cache: &Mutex<SymbolCache>,
+    name: &CStr,
 ) -> hipError_t {
+    let name: *const ::core::ffi::c_char = name.as_ptr();
     use std::io::Write;
     let name_str = if name.is_null() { "(null)".to_string() }
                    else { unsafe { CStr::from_ptr(name).to_string_lossy().to_string() } };
     if let Ok(mut f) = crate::diag("zluda_getfunc_trace.log") {
-        let _ = writeln!(f, "[get_function] hmod_base={:?} name={}", hmod.base.0, name_str);
+        let _ = writeln!(f, "[get_function] module_base={:?} name={}", module_base.0, name_str);
     }
     // VEGA-FIX T22:30 30 giu — SUPPLEMENT HSACO short-circuit per chiusura 11% residuo.
     // 4 kernel ATen float vec4 (PowKernel/sqrt/Mul/direct_copy) NON esistono in torch
@@ -842,17 +1053,17 @@ pub(crate) fn get_function(
             return Ok(());
         }
     }
-    let rc = unsafe { hipModuleGetFunction(hfunc, hmod.base, name) };
+    let rc = unsafe { hipModuleGetFunction(hfunc, module_base, name) };
     // VEGA-FIX T18:42 30 giu Worker B SymbolCache: prima del fallback strip,
     // consulta cache ELF parse (alias table Itanium canonical + fuzzy) per
     // catturare residual 11% anonymous-namespace mancato da patch A T18:32
     // (LLVMSetValueName2 + -fno-gpu-rdc + amdgpu-enable-lower-module-lds=false).
     let rc = if rc.is_err() && !name.is_null() {
-        let cache_hit = hmod.symbol_cache.lock().ok().and_then(|cache| {
+        let cache_hit = symbol_cache.lock().ok().and_then(|cache| {
             cache.resolve(&name_str).cloned()
         });
         if let Some(c_exact) = cache_hit {
-            let alt_rc = unsafe { hipModuleGetFunction(hfunc, hmod.base, c_exact.as_ptr()) };
+            let alt_rc = unsafe { hipModuleGetFunction(hfunc, module_base, c_exact.as_ptr()) };
             if let Ok(mut f) = crate::diag("zluda_getfunc_trace.log") {
                 let code: i32 = match &alt_rc { Ok(_) => 0, Err(e) => e.0.get() as i32 };
                 let _ = writeln!(f, "  [SYMCACHE] '{}' -> rc={}", c_exact.to_string_lossy(), code);
@@ -865,11 +1076,11 @@ pub(crate) fn get_function(
             }
         }
         // VEGA-FIX T19:50 30 giu — GLOBAL CROSS-MODULE LOOKUP per chiusura 11%
-        // residuo. Quando hmod corrente non ha il kernel (es. modulo OCKL runtime
+        // residuo. Quando il modulo corrente non ha il kernel (es. modulo OCKL runtime
         // support con kernels_indexed=0) ma kernel esiste in altro modulo caricato,
         // lookup nel registry globale e usa hipFunction_t valido per altro modulo.
         if let Some((other_mod, exact_name)) = resolve_global(&name_str) {
-            if other_mod.0 != hmod.base.0 {
+            if other_mod.0 != module_base.0 {
                 let alt_rc = unsafe { hipModuleGetFunction(hfunc, other_mod, exact_name.as_ptr()) };
                 if let Ok(mut f) = crate::diag("zluda_getfunc_trace.log") {
                     let code: i32 = match &alt_rc { Ok(_) => 0, Err(e) => e.0.get() as i32 };
@@ -935,7 +1146,7 @@ pub(crate) fn get_function(
         let mut final_rc = rc;
         for alt in &tried_alt {
             if let Ok(c_alt) = CString::new(alt.as_str()) {
-                let alt_rc = unsafe { hipModuleGetFunction(hfunc, hmod.base, c_alt.as_ptr()) };
+                let alt_rc = unsafe { hipModuleGetFunction(hfunc, module_base, c_alt.as_ptr()) };
                 if let Ok(mut f) = crate::diag("zluda_getfunc_trace.log") {
                     let code: i32 = match &alt_rc { Ok(_) => 0, Err(e) => e.0.get() as i32 };
                     let _ = writeln!(f, "  [TRY ALT] '{}' -> rc={}", alt, code);
@@ -968,4 +1179,42 @@ pub(crate) fn get_loading_mode(mode: &mut cuda_types::cuda::CUmoduleLoadingMode)
 
 pub(crate) fn load_fat_binary(module: &mut CUmodule, image: &std::ffi::c_void) -> CUresult {
     load_data(module, image)
+}
+
+pub(crate) unsafe fn get_tex_ref(
+    texref: *mut *mut textureReference,
+    hmod: &Module,
+    name: *const ::core::ffi::c_char,
+) -> hipError_t {
+    hipModuleGetTexRef(texref, hmod.base, name)
+}
+
+pub(crate) unsafe fn get_surf_ref(
+    surfref: &mut &surf::SurfRefData,
+    hmod: &Module,
+    name: *const ::core::ffi::c_char,
+) -> hipError_t {
+    if name.is_null() {
+        return Err(hipErrorCode_t::InvalidValue);
+    }
+    let name = CStr::from_ptr(name).to_owned();
+    let result: *const surf::SurfRefData = {
+        let mut module_mutable = hmod.mutable.lock().map_err(|_| hipErrorCode_t::Unknown)?;
+        match module_mutable.surfrefs.entry(name) {
+            hash_map::Entry::Occupied(entry) => std::ptr::from_ref(entry.get().as_ref()),
+            hash_map::Entry::Vacant(entry) => {
+                let mut texref = std::ptr::null_mut();
+                hipModuleGetTexRef(&mut texref, hmod.base, entry.key().as_ptr())?;
+                let mut devptr = mem::zeroed();
+                let mut bytes = mem::zeroed();
+                hipModuleGetGlobal(&mut devptr, &mut bytes, hmod.base, entry.key().as_ptr())?;
+                std::ptr::from_ref(entry.insert(Box::new(surf::SurfRefData {
+                    base: texref,
+                    devptr,
+                })))
+            }
+        }
+    };
+    *surfref = &*result;
+    Ok(())
 }

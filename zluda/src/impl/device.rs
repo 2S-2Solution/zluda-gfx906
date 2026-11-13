@@ -2,11 +2,11 @@ use super::{context, driver};
 use cuda_types::cuda::*;
 use hip_runtime_sys::*;
 use std::mem;
-use zluda_common::{COMPUTE_CAPABILITY_MAJOR, COMPUTE_CAPABILITY_MINOR};
 
 pub(crate) fn compute_capability(major: &mut i32, minor: &mut i32, _dev: hipDevice_t) -> CUresult {
-    *major = COMPUTE_CAPABILITY_MAJOR;
-    *minor = COMPUTE_CAPABILITY_MINOR;
+    let (major_cap, minor_cap) = driver::global_state()?.compute_capability;
+    *major = major_cap;
+    *minor = minor_cap;
     Ok(())
 }
 
@@ -61,7 +61,7 @@ macro_rules! remap_attribute {
                     paste::paste! { hipDeviceAttribute_t:: [< hipDeviceAttribute $hipWord >] }
                 }
             )*
-            _ => return Err(hipErrorCode_t::InvalidValue)
+            _ => return Err(CUerror::INVALID_VALUE)
         }
     }
 }
@@ -70,7 +70,7 @@ pub(crate) fn get_attribute(
     pi: &mut i32,
     attrib: CUdevice_attribute,
     dev_idx: hipDevice_t,
-) -> hipError_t {
+) -> CUresult {
     // VEGA-FIX T09:05 23 giu: catch-all per attr unsupported - ritorna val=0 con success
     // Evita iterazioni fix manuali per ogni nuovo attr che torch chiede.
     // Razionale: torch query attr facoltativi durante init, val=0 = "feature not present"
@@ -98,12 +98,12 @@ pub(crate) fn get_attribute_inner(
     pi: &mut i32,
     attrib: CUdevice_attribute,
     dev_idx: hipDevice_t,
-) -> hipError_t {
+) -> CUresult {
     fn get_device_prop(
         pi: &mut i32,
         dev_idx: hipDevice_t,
         f: impl FnOnce(&hipDeviceProp_tR0600) -> i32,
-    ) -> hipError_t {
+    ) -> CUresult {
         let mut props = unsafe { mem::zeroed() };
         unsafe { hipGetDevicePropertiesR0600(&mut props, dev_idx)? };
         *pi = f(&props);
@@ -266,11 +266,15 @@ pub(crate) fn get_attribute_inner(
             return get_device_prop(pi, dev_idx, |props| props.maxTexture2DMipmap[1])
         }
         CUdevice_attribute::CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR => {
-            *pi = COMPUTE_CAPABILITY_MAJOR;
+            let global = driver::global_state()?;
+            let (major_cap, _) = global.compute_capability;
+            *pi = major_cap;
             return Ok(());
         }
         CUdevice_attribute::CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR => {
-            *pi = COMPUTE_CAPABILITY_MINOR;
+            let global = driver::global_state()?;
+            let (_, minor_cap) = global.compute_capability;
+            *pi = minor_cap;
             return Ok(());
         }
         CUdevice_attribute::CU_DEVICE_ATTRIBUTE_MAXIMUM_TEXTURE1D_MIPMAPPED_WIDTH => {
@@ -449,7 +453,8 @@ pub(crate) fn get_attribute_inner(
             MEMPOOL_SUPPORTED_HANDLE_TYPES => MemoryPoolSupportedHandleTypes,
         }
     };
-    unsafe { hipDeviceGetAttribute(pi, attrib, dev_idx) }
+    unsafe { hipDeviceGetAttribute(pi, attrib, dev_idx) }?;
+    Ok(())
 }
 
 pub(crate) fn get_uuid(uuid: *mut hipUUID, device: hipDevice_t) -> hipError_t {
@@ -484,6 +489,13 @@ pub(crate) fn get_name(
 ) -> CUresult {
     unsafe { hipDeviceGetName(name, len, dev) }?;
     zluda_common::append_suffix(name, len as usize);
+    Ok(())
+}
+
+pub(crate) fn total_memory(bytes: &mut u32, dev: hipDevice_t) -> hipError_t {
+    let mut full_size = 0usize;
+    total_mem_v2(&mut full_size, dev)?;
+    *bytes = usize::min(full_size, u32::MAX as usize) as u32;
     Ok(())
 }
 
@@ -591,6 +603,22 @@ pub(crate) unsafe fn primary_context_get_state(
     *flags_out = flags;
     *active_out = active;
     Ok(())
+}
+
+pub(crate) unsafe fn can_access_peer(
+    can_access_peer: &mut ::core::ffi::c_int,
+    dev1: hipDevice_t,
+    dev2: hipDevice_t,
+) -> hipError_t {
+    hipDeviceCanAccessPeer(can_access_peer, dev1, dev2)
+}
+
+pub(crate) unsafe fn get_p_c_i_bus_id(
+    pci_bus_id: *mut ::core::ffi::c_char,
+    len: ::core::ffi::c_int,
+    dev: hipDevice_t,
+) -> hipError_t {
+    hipDeviceGetPCIBusId(pci_bus_id, len, dev)
 }
 
 #[cfg(test)]

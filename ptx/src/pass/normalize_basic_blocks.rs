@@ -21,11 +21,11 @@ pub(crate) fn run(
 ) -> Result<Vec<Directive2<ast::Instruction<SpirvWord>, SpirvWord>>, TranslateError> {
     for directive in directives.iter_mut() {
         let (body_ref, is_kernel) = match directive {
-            Directive2::Method(Function2 {
+            Directive2::Method(Function {
                 body: Some(body),
-                is_kernel,
+                kernel_attributes,
                 ..
-            }) => (body, *is_kernel),
+            }) => (body, kernel_attributes.is_some()),
             _ => continue,
         };
         let body = std::mem::replace(body_ref, Vec::new());

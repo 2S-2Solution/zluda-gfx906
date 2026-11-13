@@ -3,6 +3,8 @@ use cuda_types::{
     cublaslt::*,
     cuda::*,
     cudnn9,
+    cufft::*,
+    cusparse::*,
     dark_api::{FatbinHeader, FatbincWrapper},
     nvml::*,
 };
@@ -11,6 +13,7 @@ use hip_runtime_sys::*;
 use hipblaslt_sys::*;
 use miopen_sys::*;
 use rocblas_sys::*;
+use rocsparse_sys::*;
 use std::{
     ffi::{c_void, CStr},
     mem::{self, ManuallyDrop, MaybeUninit},
@@ -18,9 +21,12 @@ use std::{
     str::Utf8Error,
 };
 
-pub const PROJECT_SUFFIX: &[u8] = b" [ZLUDA]\0";
-pub const COMPUTE_CAPABILITY_MAJOR: i32 = 8;
-pub const COMPUTE_CAPABILITY_MINOR: i32 = 8;
+pub mod constants;
+use constants::*;
+#[cfg_attr(windows, path = "os_win.rs")]
+#[cfg_attr(not(windows), path = "os_unix.rs")]
+pub mod os;
+pub mod test;
 
 pub fn append_suffix(name: *mut ::core::ffi::c_char, len: usize) {
     let buffer = unsafe { std::slice::from_raw_parts(name, len) };
@@ -74,6 +80,21 @@ impl CudaErrorType for miopen_sys::miopenError_t {
     const NOT_SUPPORTED: Self = Self::NotImplemented;
 }
 
+impl CudaErrorType for cusparseError_t {
+    const INVALID_VALUE: Self = Self::INVALID_VALUE;
+    const NOT_SUPPORTED: Self = Self::NOT_SUPPORTED;
+}
+
+impl CudaErrorType for rocsparse_error {
+    const INVALID_VALUE: Self = Self::invalid_value;
+    const NOT_SUPPORTED: Self = Self::not_implemented;
+}
+
+impl CudaErrorType for cufftError_t {
+    const INVALID_VALUE: Self = Self::INVALID_VALUE;
+    const NOT_SUPPORTED: Self = Self::NOT_SUPPORTED;
+}
+
 /// Used to try to convert CUDA API values into our internal representation.
 ///
 /// Similar to [`TryFrom`], but we can implement this for primitive types. We also provide conversions from pointers to references.
@@ -121,6 +142,7 @@ macro_rules! from_cuda_nop {
 macro_rules! from_cuda_transmute {
     ($($from:ty => $to:ty),*) => {
         $(
+            #[cfg(target_pointer_width = "64")]
             impl<'a, E: CudaErrorType> FromCuda<'a, $from, E> for $to {
                 fn from_cuda(x: &'a $from) -> Result<Self, E> {
                     Ok(unsafe { std::mem::transmute(*x) })
@@ -136,6 +158,12 @@ macro_rules! from_cuda_transmute {
                 }
             }
 
+            impl<'a, E: CudaErrorType> FromCuda<'a, *const $from, E> for * const $to {
+                fn from_cuda(x: &'a *const $from) -> Result<Self, E> {
+                    Ok(x.cast::<$to>())
+                }
+            }
+
             impl<'a, E: CudaErrorType> FromCuda<'a, *mut $from, E> for * mut $to {
                 fn from_cuda(x: &'a *mut $from) -> Result<Self, E> {
                     Ok(x.cast::<$to>())
@@ -147,6 +175,15 @@ macro_rules! from_cuda_transmute {
                     Ok(x.cast::<*const $to>())
                 }
             }
+
+            impl<'a, E: CudaErrorType> FromCuda<'a, *const $from, E> for &'a $to {
+                fn from_cuda(x: &'a *const $from) -> Result<Self, E> {
+                    match unsafe { x.cast::<$to>().as_ref() } {
+                        Some(x) => Ok(x),
+                        None => Err(E::INVALID_VALUE),
+                    }
+                }
+            }
         )*
     };
 }
@@ -156,16 +193,17 @@ macro_rules! from_cuda_transmute {
 macro_rules! from_cuda_object {
     ($($type_:ty),*) => {
         $(
-            impl<'a> zluda_common::FromCuda<'a, <$type_ as zluda_common::ZludaObject>::CudaHandle, <$type_ as zluda_common::ZludaObject>::Error> for &'a $type_ {
-                fn from_cuda(handle: &'a <$type_ as zluda_common::ZludaObject>::CudaHandle) -> Result<&'a $type_, <$type_ as zluda_common::ZludaObject>::Error> {
-                    use zluda_common::CudaErrorType;
-                    Ok(zluda_common::as_ref(handle).ok_or(<$type_ as zluda_common::ZludaObject>::Error::INVALID_VALUE)?.as_result()?)
+            #[allow(unused_imports)]
+            impl<'a> $crate::FromCuda<'a, <$type_ as $crate::ZludaObject>::CudaHandle, <$type_ as $crate::ZludaObject>::Error> for &'a $type_ {
+                fn from_cuda(handle: &'a <$type_ as $crate::ZludaObject>::CudaHandle) -> Result<&'a $type_, <$type_ as $crate::ZludaObject>::Error> {
+                    use $crate::CudaErrorType;
+                    Ok($crate::as_ref(handle).ok_or(<$type_ as $crate::ZludaObject>::Error::INVALID_VALUE)?.as_result()?)
                 }
             }
 
             // If the CUDA handle is not pointer sized it will break assumptions in `as_ref`
             const _: fn() = || {
-                let _ = std::mem::transmute::<<$type_ as zluda_common::ZludaObject>::CudaHandle, usize>;
+                let _ = std::mem::transmute::<<$type_ as $crate::ZludaObject>::CudaHandle, usize>;
             };
         )*
     };
@@ -174,12 +212,16 @@ macro_rules! from_cuda_object {
 from_cuda_nop!(
     *mut i8,
     *mut i32,
+    *const i32,
+    *mut i64,
     *mut u64,
     *mut usize,
     *const f32,
     *mut f32,
     *const f64,
     *mut f64,
+    *mut float2,
+    *mut double2,
     *const ::core::ffi::c_void,
     *const *const ::core::ffi::c_void,
     *const *mut ::core::ffi::c_void,
@@ -187,10 +229,12 @@ from_cuda_nop!(
     *mut ::core::ffi::c_void,
     *mut *mut ::core::ffi::c_void,
     u8,
+    u16,
     i32,
     u32,
     u64,
     i64,
+    f32,
     usize,
     cuda_types::cuda::CUdevprop,
     CUdevice_attribute,
@@ -222,16 +266,27 @@ from_cuda_nop!(
     CUresult,
     CUfunction_attribute,
     CUgraphExecUpdateResultInfo,
+    *mut *const cuda_types::cuda::CUgraphEdgeData,
     *mut cudnn9::cudnnHandle_t,
     cudnn9::cudnnHandle_t,
     cudnn9::cudnnMathType_t,
     cudnn9::cudnnConvolutionFwdAlgoPerfStruct,
     *mut cuda_types::cublas::__half,
-    *const cuda_types::cublas::__half
+    *const cuda_types::cublas::__half,
+    cudnn9::cudnnDataType_t,
+    cudnn9::cudnnTensorFormat_t,
+    cudnn9::cudnnConvolutionBwdDataAlgoPerf_t,
+    cudnn9::cudnnConvolutionBwdFilterAlgoPerf_t,
+    cublasLtMatmulPreferenceAttributes_t,
+    CUfunc_cache,
+    CUctxCreateParams,
+    cufftHandle,
+    cuda_types::cuda::libraryPropertyType,
+    CUgraphicsResource,
+    CUsharedconfig
 );
 from_cuda_transmute!(
     CUuuid => hipUUID,
-    CUfunction => hipFunction_t,
     CUpointer_attribute => hipPointer_attribute,
     CUdeviceptr_v2 => hipDeviceptr_t,
     CUevent => hipEvent_t,
@@ -242,14 +297,35 @@ from_cuda_transmute!(
     CUstreamCaptureMode => hipStreamCaptureMode,
     CUgraphNode => hipGraphNode_t,
     CUgraphExec => hipGraphExec_t,
-    CUkernel => hipFunction_t,
     cublasLtMatmulDesc_t => hipblasLtMatmulDesc_t,
     cublasLtMatmulPreference_t => hipblasLtMatmulPreference_t,
     cublasLtMatrixLayout_t => hipblasLtMatrixLayout_t,
     cublasPointerMode_t => rocblas_pointer_mode,
     cudnn9::cudnnTensorDescriptor_t => miopenTensorDescriptor_t,
     cudnn9::cudnnFilterDescriptor_t => miopenTensorDescriptor_t,
-    cudnn9::cudnnConvolutionDescriptor_t => miopenConvolutionDescriptor_t
+    cudnn9::cudnnConvolutionDescriptor_t => miopenConvolutionDescriptor_t,
+    cudnn9::cudnnDropoutDescriptor_t => miopenDropoutDescriptor_t,
+    cusparseHandle_t => rocsparse_handle,
+    cusparseMatrixType_t => rocsparse_matrix_type,
+    cusparseConstSpMatDescr_t => rocsparse_const_spmat_descr,
+    cusparseDnMatDescr_t => rocsparse_dnmat_descr,
+    cusparseConstDnMatDescr_t => rocsparse_const_dnmat_descr,
+    cusparseIndexType_t => rocsparse_indextype,
+    cusparseIndexBase_t => rocsparse_index_base,
+    cusparseMatDescr_t => rocsparse_mat_descr,
+    CUtexObject => hipTextureObject_t,
+    CUDA_RESOURCE_DESC => HIP_RESOURCE_DESC,
+    CUDA_TEXTURE_DESC => HIP_TEXTURE_DESC,
+    CUDA_RESOURCE_VIEW_DESC => HIP_RESOURCE_VIEW_DESC,
+    CUarray => hipArray_t,
+    CUDA_ARRAY_DESCRIPTOR => HIP_ARRAY_DESCRIPTOR,
+    CUDA_ARRAY3D_DESCRIPTOR => HIP_ARRAY3D_DESCRIPTOR,
+    CUtexref => *mut textureReference,
+    CUarray_format => hipArray_Format,
+    CUaddress_mode => hipTextureAddressMode,
+    CUfilter_mode => hipTextureFilterMode,
+    cufftType_t => hipfft_sys::hipfftType,
+    CUgraphicsResource => hipGraphicsResource_t
 );
 
 // [VEGA-PATCH stream-nullo, 17 ott 2026] CUstream non passa piu' dal transmute.
@@ -286,6 +362,86 @@ impl<'a, E: CudaErrorType> FromCuda<'a, *mut CUstream, E> for *mut hipStream_t {
 impl<'a, E: CudaErrorType> FromCuda<'a, *mut *const CUstream, E> for *mut *const hipStream_t {
     fn from_cuda(x: &'a *mut *const CUstream) -> Result<Self, E> {
         Ok(x.cast::<*const hipStream_t>())
+    }
+}
+
+impl<'a, E: CudaErrorType> FromCuda<'a, *const CUDA_MEMCPY3D, E> for HIP_MEMCPY3D {
+    fn from_cuda(memcpy: &'a *const CUDA_MEMCPY3D) -> Result<Self, E> {
+        let memcpy = unsafe { memcpy.as_ref() }.ok_or(E::INVALID_VALUE)?;
+        Ok(HIP_MEMCPY3D {
+            srcXInBytes: memcpy.srcXInBytes,
+            srcY: memcpy.srcY,
+            srcZ: memcpy.srcZ,
+            srcLOD: memcpy.srcLOD,
+            srcMemoryType: from_memory_type(memcpy.srcMemoryType)?,
+            srcHost: memcpy.srcHost,
+            srcDevice: hipDeviceptr_t(memcpy.srcDevice.0),
+            srcArray: memcpy.srcArray as hipArray_t,
+            srcPitch: memcpy.srcPitch,
+            srcHeight: memcpy.srcHeight,
+            dstXInBytes: memcpy.dstXInBytes,
+            dstY: memcpy.dstY,
+            dstZ: memcpy.dstZ,
+            dstLOD: memcpy.dstLOD,
+            dstMemoryType: from_memory_type(memcpy.dstMemoryType)?,
+            dstHost: memcpy.dstHost,
+            dstDevice: hipDeviceptr_t(memcpy.dstDevice.0),
+            dstArray: memcpy.dstArray as hipArray_t,
+            dstPitch: memcpy.dstPitch,
+            dstHeight: memcpy.dstHeight,
+            WidthInBytes: memcpy.WidthInBytes,
+            Height: memcpy.Height,
+            Depth: memcpy.Depth,
+        })
+    }
+}
+
+fn from_memory_type<E: CudaErrorType>(cuda: CUmemorytype) -> Result<hipMemoryType, E> {
+    Ok(match cuda {
+        CUmemorytype::CU_MEMORYTYPE_HOST => hipMemoryType::hipMemoryTypeHost,
+        CUmemorytype::CU_MEMORYTYPE_DEVICE => hipMemoryType::hipMemoryTypeDevice,
+        CUmemorytype::CU_MEMORYTYPE_ARRAY => hipMemoryType::hipMemoryTypeArray,
+        CUmemorytype::CU_MEMORYTYPE_UNIFIED => hipMemoryType::hipMemoryTypeUnified,
+        _ => return Err(E::NOT_SUPPORTED),
+    })
+}
+
+impl<'a, E: CudaErrorType> FromCuda<'a, cusparseSpMMAlg_t, E> for rocsparse_spmm_alg {
+    fn from_cuda(alg: &'a cusparseSpMMAlg_t) -> Result<Self, E> {
+        Ok(match *alg {
+            cusparseSpMMAlg_t::CUSPARSE_SPMM_BLOCKED_ELL_ALG1 => {
+                rocsparse_spmm_alg::rocsparse_spmm_alg_default
+            }
+            cusparseSpMMAlg_t::CUSPARSE_SPMM_BSR_ALG1 => rocsparse_spmm_alg::rocsparse_spmm_alg_bsr,
+            _ => rocsparse_spmm_alg::rocsparse_spmm_alg_default,
+        })
+    }
+}
+
+impl<'a, E: CudaErrorType> FromCuda<'a, cusparseOperation_t, E> for rocsparse_operation {
+    fn from_cuda(operation: &'a cusparseOperation_t) -> Result<Self, E> {
+        Ok(match *operation {
+            cusparseOperation_t::CUSPARSE_OPERATION_NON_TRANSPOSE => {
+                rocsparse_operation::rocsparse_operation_none
+            }
+            cusparseOperation_t::CUSPARSE_OPERATION_TRANSPOSE => {
+                rocsparse_operation::rocsparse_operation_transpose
+            }
+            cusparseOperation_t::CUSPARSE_OPERATION_CONJUGATE_TRANSPOSE => {
+                rocsparse_operation::rocsparse_operation_conjugate_transpose
+            }
+            _ => return Err(E::NOT_SUPPORTED),
+        })
+    }
+}
+
+impl<'a, E: CudaErrorType> FromCuda<'a, cusparseOrder_t, E> for rocsparse_order {
+    fn from_cuda(order: &'a cusparseOrder_t) -> Result<Self, E> {
+        Ok(match *order {
+            cusparseOrder_t::CUSPARSE_ORDER_COL => rocsparse_order::rocsparse_order_column,
+            cusparseOrder_t::CUSPARSE_ORDER_ROW => rocsparse_order::rocsparse_order_row,
+            _ => return Err(E::NOT_SUPPORTED),
+        })
     }
 }
 
@@ -335,6 +491,22 @@ impl<'a, E: CudaErrorType> FromCuda<'a, CUjit_option, E> for hipJitOption {
             CUjit_option::CU_JIT_OVERRIDE_DIRECTIVE_VALUES => {
                 hipJitOption::hipJitOptionOverrideDirectiveValues
             }
+            _ => return Err(E::NOT_SUPPORTED),
+        })
+    }
+}
+
+impl<'a, E: CudaErrorType> FromCuda<'a, cudaDataType, E> for rocsparse_datatype {
+    fn from_cuda(type_: &'a cudaDataType) -> Result<Self, E> {
+        Ok(match *type_ {
+            cudaDataType::CUDA_R_32F => rocsparse_datatype::rocsparse_datatype_f32_r,
+            cudaDataType::CUDA_R_64F => rocsparse_datatype::rocsparse_datatype_f64_r,
+            cudaDataType::CUDA_C_32F => rocsparse_datatype::rocsparse_datatype_f32_c,
+            cudaDataType::CUDA_C_64F => rocsparse_datatype::rocsparse_datatype_f64_c,
+            cudaDataType::CUDA_R_8I => rocsparse_datatype::rocsparse_datatype_i8_r,
+            cudaDataType::CUDA_R_8U => rocsparse_datatype::rocsparse_datatype_u8_r,
+            cudaDataType::CUDA_R_32I => rocsparse_datatype::rocsparse_datatype_i32_r,
+            cudaDataType::CUDA_R_32U => rocsparse_datatype::rocsparse_datatype_u32_r,
             _ => return Err(E::NOT_SUPPORTED),
         })
     }
@@ -786,6 +958,99 @@ impl<'a, E: CudaErrorType> FromCuda<'a, cudnn9::cudnnConvolutionFwdAlgo_t, E>
                 miopenConvFwdAlgorithm_t::miopenConvolutionFwdAlgoWinograd
             }
             _ => return Err(E::NOT_SUPPORTED),
+        })
+    }
+}
+
+impl<'a, E: CudaErrorType> FromCuda<'a, cudnn9::cudnnConvolutionBwdDataAlgo_t, E>
+    for miopenConvBwdDataAlgorithm_t
+{
+    fn from_cuda(format: &'a cudnn9::cudnnConvolutionBwdDataAlgo_t) -> Result<Self, E> {
+        Ok(match *format {
+            cudnn9::cudnnConvolutionBwdDataAlgo_t::CUDNN_CONVOLUTION_BWD_DATA_ALGO_0 => {
+                miopenConvBwdDataAlgorithm_t::miopenConvolutionBwdDataAlgoGEMM
+            }
+            cudnn9::cudnnConvolutionBwdDataAlgo_t::CUDNN_CONVOLUTION_BWD_DATA_ALGO_1 => {
+                miopenConvBwdDataAlgorithm_t::miopenConvolutionBwdDataAlgoDirect
+            }
+            cudnn9::cudnnConvolutionBwdDataAlgo_t::CUDNN_CONVOLUTION_BWD_DATA_ALGO_FFT => {
+                miopenConvBwdDataAlgorithm_t::miopenConvolutionBwdDataAlgoFFT
+            }
+            cudnn9::cudnnConvolutionBwdDataAlgo_t::CUDNN_CONVOLUTION_BWD_DATA_ALGO_FFT_TILING => {
+                // No direct MIOpen equivalent; map to FFT variant
+                miopenConvBwdDataAlgorithm_t::miopenConvolutionBwdDataAlgoFFT
+            }
+            cudnn9::cudnnConvolutionBwdDataAlgo_t::CUDNN_CONVOLUTION_BWD_DATA_ALGO_WINOGRAD => {
+                miopenConvBwdDataAlgorithm_t::miopenConvolutionBwdDataAlgoWinograd
+            }
+            cudnn9::cudnnConvolutionBwdDataAlgo_t::CUDNN_CONVOLUTION_BWD_DATA_ALGO_WINOGRAD_NONFUSED => {
+                // No direct MIOpen equivalent; map to Winograd variant
+                miopenConvBwdDataAlgorithm_t::miopenConvolutionBwdDataAlgoWinograd
+            }
+            cudnn9::cudnnConvolutionBwdDataAlgo_t(bwd_algo) => {
+                if bwd_algo == cudnn9::cudnnConvolutionBwdDataAlgo_t::CUDNN_CONVOLUTION_BWD_DATA_ALGO_COUNT.0 + 1 {
+                    miopenConvBwdDataAlgorithm_t::miopenConvolutionBwdDataAlgoImplicitGEMM
+                } else {
+                    return Err(E::NOT_SUPPORTED)
+                }
+            },
+        })
+    }
+}
+
+impl<'a, E: CudaErrorType> FromCuda<'a, cudnn9::cudnnConvolutionBwdFilterAlgo_t, E>
+    for miopenConvBwdWeightsAlgorithm_t
+{
+    fn from_cuda(format: &'a cudnn9::cudnnConvolutionBwdFilterAlgo_t) -> Result<Self, E> {
+        Ok(match *format {
+            cudnn9::cudnnConvolutionBwdFilterAlgo_t::CUDNN_CONVOLUTION_BWD_FILTER_ALGO_0 => {
+                miopenConvBwdWeightsAlgorithm_t::miopenConvolutionBwdWeightsAlgoGEMM
+            }
+            cudnn9::cudnnConvolutionBwdFilterAlgo_t::CUDNN_CONVOLUTION_BWD_FILTER_ALGO_1 => {
+                miopenConvBwdWeightsAlgorithm_t::miopenConvolutionBwdWeightsAlgoDirect
+            }
+            cudnn9::cudnnConvolutionBwdFilterAlgo_t::CUDNN_CONVOLUTION_BWD_FILTER_ALGO_FFT => {
+                miopenConvBwdWeightsAlgorithm_t::miopenConvolutionBwdWeightsAlgoGEMM
+            }
+            cudnn9::cudnnConvolutionBwdFilterAlgo_t::CUDNN_CONVOLUTION_BWD_FILTER_ALGO_FFT_TILING => {
+                miopenConvBwdWeightsAlgorithm_t::miopenConvolutionBwdWeightsAlgoGEMM
+            }
+            cudnn9::cudnnConvolutionBwdFilterAlgo_t::CUDNN_CONVOLUTION_BWD_FILTER_ALGO_3 => {
+                miopenConvBwdWeightsAlgorithm_t::miopenConvolutionBwdWeightsAlgoImplicitGEMM
+            }
+            cudnn9::cudnnConvolutionBwdFilterAlgo_t::CUDNN_CONVOLUTION_BWD_FILTER_ALGO_WINOGRAD => {
+                miopenConvBwdWeightsAlgorithm_t::miopenConvolutionBwdWeightsAlgoWinograd
+            }
+            cudnn9::cudnnConvolutionBwdFilterAlgo_t::CUDNN_CONVOLUTION_BWD_FILTER_ALGO_WINOGRAD_NONFUSED => {
+                miopenConvBwdWeightsAlgorithm_t::miopenConvolutionBwdWeightsAlgoWinograd
+            }
+            _ => return Err(E::NOT_SUPPORTED),
+        })
+    }
+}
+
+impl<'a, E: CudaErrorType> FromCuda<'a, *const CUDA_MEMCPY2D_v2, E>
+    for hip_runtime_sys::hip_Memcpy2D
+{
+    fn from_cuda(format: &'a *const CUDA_MEMCPY2D_v2) -> Result<Self, E> {
+        let format = unsafe { format.as_ref() }.ok_or(E::INVALID_VALUE)?;
+        Ok(hip_Memcpy2D {
+            srcXInBytes: format.srcXInBytes,
+            srcY: format.srcY,
+            srcMemoryType: from_memory_type(format.srcMemoryType)?,
+            srcHost: format.srcHost,
+            srcDevice: hipDeviceptr_t(format.srcDevice.0),
+            srcArray: format.srcArray.cast(),
+            srcPitch: format.srcPitch,
+            dstXInBytes: format.dstXInBytes,
+            dstY: format.dstY,
+            dstMemoryType: from_memory_type(format.dstMemoryType)?,
+            dstHost: format.dstHost,
+            dstDevice: hipDeviceptr_t(format.dstDevice.0),
+            dstArray: format.dstArray.cast(),
+            dstPitch: format.dstPitch,
+            WidthInBytes: format.WidthInBytes,
+            Height: format.Height,
         })
     }
 }

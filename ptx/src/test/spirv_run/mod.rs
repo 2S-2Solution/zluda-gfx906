@@ -2,14 +2,19 @@ use super::read_test_file;
 use crate::pass;
 use cuda_types::cuda::CUstream;
 use hip_runtime_sys::hipError_t;
+use hip_runtime_sys::hipStream_t;
+use kernel_metadata::ArchivedModuleMetadata32Bit;
 use pretty_assertions;
+use std::alloc::Layout;
 use std::env;
 use std::error;
 use std::ffi::{CStr, CString};
 use std::fmt::{self, Debug, Display, Formatter};
 use std::fs::{self, File};
 use std::io::Write;
+use std::iter;
 use std::mem;
+use std::os::raw::c_void;
 use std::path::Path;
 use std::ptr;
 use std::str;
@@ -57,6 +62,46 @@ macro_rules! test_ptx {
     };
 }
 
+macro_rules! test_ptx_with_32 {
+    ($fn_name:ident, $input:expr, $output:expr) => {
+        paste::item! {
+            #[test]
+            fn [<$fn_name _amdgpu>]() -> Result<(), Box<dyn std::error::Error>> {
+                let ptx = read_test_file!(concat!(stringify!($fn_name), ".ptx"));
+                let input = $input;
+                let output = $output;
+                test_hip_assert(stringify!($fn_name), &ptx, Some(&input), &output, 1)
+            }
+        }
+
+        paste::item! {
+            #[test]
+            fn [<$fn_name _cuda>]() -> Result<(), Box<dyn std::error::Error>> {
+                let ptx = read_test_file!(concat!(stringify!($fn_name), ".ptx"));
+                let input = $input;
+                let output = $output;
+                test_cuda_assert(stringify!($fn_name), &ptx, Some(&input), &output, 1)
+            }
+        }
+
+        test_ptx_llvm!($fn_name);
+
+        paste::item! {
+            #[test]
+            fn [<$fn_name _amdgpu32>]() -> Result<(), Box<dyn std::error::Error>> {
+                let ptx = read_test_file!(concat!("32/", stringify!($fn_name), ".ptx"));
+                let input = $input;
+                let output = $output;
+                test_zluda32_assert(stringify!($fn_name), &ptx, Some(&input), &output, 1)
+            }
+        }
+    };
+
+    ($fn_name:ident) => {
+        test_ptx_llvm!($fn_name);
+    };
+}
+
 macro_rules! test_ptx_warp {
     ($fn_name:ident, $output:expr) => {
         paste::item! {
@@ -84,9 +129,63 @@ macro_rules! test_ptx_warp {
 test_ptx!(ld_st, [1u64], [1u64]);
 test_ptx!(ld_st_implicit, [0.5f32, 0.25f32], [0.5f32]);
 test_ptx!(mov, [1u64], [1u64]);
+test_ptx!(sink, [1u32, 2u32, 3u32, 4u32], [2u32, 1u32, 3u32]);
 test_ptx!(mul_lo, [1u64], [2u64]);
 test_ptx!(mul_hi, [u64::max_value()], [1u64]);
-test_ptx!(add, [1u64], [2u64]);
+test_ptx_with_32!(add, [1u64], [2u64]);
+test_ptx!(exit, [1u64], [2u64]);
+test_ptx!(
+    add_extended,
+    [
+        0xFFFFFFFFu32,
+        0xFFFFFFFFu32,
+        0xFFFFFFFFu32,
+        0x00000000u32,
+        0x00000001u32,
+        0x00000000u32,
+        0x00000000u32,
+        0x00000000u32
+    ],
+    [0x00000000u32, 0x00000000u32, 0x00000000u32, 0x00000001u32]
+);
+test_ptx!(
+    sub_extended,
+    [
+        0x00000000u32,
+        0x00000000u32,
+        0x00000000u32,
+        0x00000001u32,
+        0x00000001u32,
+        0x00000000u32,
+        0x00000000u32,
+        0x00000000u32
+    ],
+    [0xFFFFFFFFu32, 0xFFFFFFFFu32, 0xFFFFFFFFu32, 0x00000000u32]
+);
+test_ptx!(
+    mad_extended,
+    [
+        0xFFFFFFFFu32, // a0 = 2^32 - 1
+        0x00000002u32, // b0 = 2
+        // a0 * b0 = 0x1_FFFF_FFFE (low 32 bits = 0xFFFFFFFE)
+        0x00000001u32, // c0: 0xFFFFFFFE + 1 = 0xFFFFFFFF, no carry
+        0x00000001u32, // c1: 0xFFFFFFFE + 1 + 0 (carry) = 0xFFFFFFFF, no carry
+        0x00000002u32, // c2: 0xFFFFFFFE + 2 + 0 (carry) = 0x1_00000000, carry out
+        0x00000000u32  // c3: 0xFFFFFFFE + 0 + 1 (carry) = 0xFFFFFFFF
+    ],
+    [
+        0xFFFFFFFFu32, // r0
+        0xFFFFFFFFu32, // r1
+        0x00000000u32, // r2 (overflow to 0)
+        0xFFFFFFFFu32  // r3 (carry in from r2)
+    ]
+);
+test_ptx!(
+    addc_cc_s32,
+    [0x62D0B1FDu32, 0xB632D4DFu32],
+    [0x1190386DDu64]
+);
+test_ptx!(subc_cc_s32, [0x627ADF75u32, 0x864CCEF5u32], [3694006400u64]);
 test_ptx!(
     mul24_lo_u32,
     [0b01110101_01010101_01010101u32],
@@ -110,6 +209,8 @@ test_ptx!(
 test_ptx!(setp, [10u64, 11u64], [1u64, 0u64]);
 test_ptx!(setp_gt, [f32::NAN, 1f32], [1f32]);
 test_ptx!(setp_leu, [1f32, f32::NAN], [1f32]);
+test_ptx!(setp_bool_and, [1u32, 2u32, 0u32], [1u32]);
+test_ptx!(setp_pred2, [1u32, 2u32], [1u32, 0u32, 1u32, 0u32, 1u32]);
 test_ptx!(bra, [10u64], [11u64]);
 test_ptx!(not, [0u64], [u64::max_value()]);
 test_ptx!(shl, [11u64], [44u64]);
@@ -165,11 +266,12 @@ test_ptx!(
 );
 test_ptx!(min_nan_f16);
 test_ptx!(max, [555i32, 444i32], [555i32]);
-test_ptx!(global_array, [0xDEADu32], [1u32]);
+test_ptx_with_32!(global_array, [0xDEADu32], [1u32]);
 test_ptx!(global_array_f32, [0x0], [0f32]);
-test_ptx!(extern_shared, [127u64], [127u64]);
+test_ptx_with_32!(extern_shared, [127u64], [127u64]);
 test_ptx!(extern_shared_call, [121u64], [123u64]);
 test_ptx!(rcp, [2f32], [0.5f32]);
+test_ptx!(rcp_f64, [2f64], [0.5f64]);
 // 0b1_00000000_10000000000000000000000u32 is a large denormal
 // 0x3f000000 is 0.5
 test_ptx!(
@@ -199,11 +301,11 @@ test_ptx!(
     [0x40004040, 0x40404080, 0x40A04040],
     [1183860456u32]
 );
-test_ptx!(shared_variable, [513u64], [513u64]);
+test_ptx_with_32!(shared_variable, [513u64], [513u64]);
 test_ptx!(shared_ptr_32, [513u64], [513u64]);
 test_ptx!(atom_cas, [91u32, 91u32], [91u32, 100u32]);
 test_ptx!(atom_inc, [100u32], [100u32, 101u32, 0u32]);
-test_ptx!(atom_add, [2u32, 4u32], [2u32, 6u32]);
+test_ptx_with_32!(atom_add, [2u32, 4u32], [2u32, 6u32]);
 test_ptx!(div_approx, [1f32, 2f32], [0.5f32]);
 test_ptx!(sqrt, [0.25f32], [0.5f32]);
 test_ptx!(sqrt_rn_ftz, [0x1u32], [0x0u32]);
@@ -227,8 +329,23 @@ test_ptx!(
 test_ptx!(cvt_rn_f16x2_e4m3x2, [0x2D55u16], [0x36804a80u32]);
 test_ptx!(cvt_rn_f16x2_e5m2x2, [0x36EDu16], [0x3600ED00u32]);
 test_ptx!(cvt_rn_bf16x2_f32, [0.40625, 12.9f32], [0x3ED0414Eu32]);
+test_ptx!(
+    cvt_u64_f16,
+    [
+        half::f16::from_f32(-0.0),
+        half::f16::NAN,
+        half::f16::INFINITY
+    ],
+    [0u64, 9223372036854775808, 18446744073709551615u64]
+);
 test_ptx!(clz, [0b00000101_00101101_00010011_10101011u32], [5u32]);
+test_ptx!(
+    bfind_shiftamt,
+    [0u32, u32::MAX, 0x2cd1a4c1u32],
+    [4294967295u32, 0, 2]
+);
 test_ptx!(popc, [0b10111100_10010010_01001001_10001010u32], [14u32]);
+test_ptx!(popc_b64, [0x99427D688BCB5258u64], [30u32]);
 test_ptx!(
     brev,
     [0b11000111_01011100_10101110_11111011u32],
@@ -249,6 +366,7 @@ test_ptx!(
     [0b11000001u32]
 );
 test_ptx!(bfi, [0b10u32, 0b101u32, 0u32, 2u32], [0b110u32]);
+test_ptx!(bmsk_clamp_b32, [24u32, 12u32], [0xFF000000u32]);
 test_ptx!(stateful_ld_st_simple, [121u64], [121u64]);
 test_ptx!(stateful_ld_st_ntid, [123u64], [123u64]);
 test_ptx!(stateful_ld_st_ntid_chain, [12651u64], [12651u64]);
@@ -258,7 +376,7 @@ test_ptx!(cvt_s64_s32, [-1i32], [-1i64]);
 test_ptx!(add_tuning, [2u64], [3u64]);
 test_ptx!(add_non_coherent, [3u64], [4u64]);
 test_ptx!(sign_extend, [-1i16], [-1i32]);
-test_ptx!(atom_add_float, [1.25f32, 0.5f32], [1.25f32, 1.75f32]);
+test_ptx_with_32!(atom_add_float, [1.25f32, 0.5f32], [1.25f32, 1.75f32]);
 test_ptx!(
     setp_nan,
     [
@@ -289,7 +407,7 @@ test_ptx!(
 );
 test_ptx!(non_scalar_ptr_offset, [1u32, 2u32, 3u32, 4u32], [7u32]);
 test_ptx!(stateful_neg_offset, [1237518u64], [1237518u64]);
-test_ptx!(const, [0u16], [10u16, 20, 30, 40]);
+test_ptx_with_32!(const, [0u16], [10u16, 20, 30, 40]);
 test_ptx!(const_ident, [0u16], [0u64, 0u64]);
 test_ptx!(cvt_s16_s8, [0x139231C2u32], [0xFFFFFFC2u32]);
 test_ptx!(cvt_f64_f32, [0.125f32], [0.125f64]);
@@ -299,7 +417,12 @@ test_ptx!(
     [0x70c507d6u32, 0x6fbd4b5cu32, 30212],
     [0x6fbdd65cu32]
 );
-test_ptx!(activemask, [0u32], [1u32]);
+test_ptx!(
+    prmt_signext,
+    [0x0100FE80u32, 0x00000000u32],
+    [0x800080FFu32]
+);
+test_ptx_with_32!(activemask, [0u32], [1u32]);
 test_ptx!(membar, [152731u32], [152731u32]);
 test_ptx!(shared_unify_extern, [7681u64, 7682u64], [15363u64]);
 test_ptx!(shared_unify_local, [16752u64, 714u64], [17466u64]);
@@ -370,6 +493,16 @@ test_ptx!(
     [0x8e2da590u32, 0xedeaee14, 0x248a9f70],
     [613065134u32]
 );
+test_ptx!(
+    dp2a,
+    [0x8e2da590u32, 0xedeaee14, 0x248a9f70],
+    [614127545u32]
+);
+test_ptx!(
+    vshr_clamp,
+    [0x8e2da590u32, 16, 0x248a9f70],
+    [613100957, 613064560]
+);
 test_ptx!(param_is_addressable, [0xDEAD], [0u64]);
 // TODO: re-enable when we have a patched LLVM
 //test_ptx!(
@@ -397,6 +530,18 @@ test_ptx!(
     ],
     [4294967295u32, 65535]
 );
+test_ptx!(
+    set_gt_f16x2,
+    [
+        half::f16::from_f32(-0.0),
+        half::f16::from_bits(0x38d3),
+        half::f16::from_f32(0.0),
+        half::f16::from_bits(0x35aa),
+    ],
+    [1006632960u32]
+);
+test_ptx!(uint_to_fp_bf16, [1u32, 3u32], [0x3F80u32]);
+test_ptx!(sad_s64, [12i64, -38, 915], [965i64, 965]);
 
 test_ptx!(assertfail);
 // TODO: not yet supported
@@ -407,6 +552,75 @@ test_ptx!(trap);
 test_ptx!(noreturn);
 test_ptx!(createpolicy);
 
+test_ptx_warp!(
+    match_sync,
+    [
+        0x55555555u32,
+        0xAAAAAAAAu32,
+        0x55555555u32,
+        0xAAAAAAAAu32,
+        0x55555555u32,
+        0xAAAAAAAAu32,
+        0x55555555u32,
+        0xAAAAAAAAu32,
+        0x55555555u32,
+        0xAAAAAAAAu32,
+        0x55555555u32,
+        0xAAAAAAAAu32,
+        0x55555555u32,
+        0xAAAAAAAAu32,
+        0x55555555u32,
+        0xAAAAAAAAu32,
+        0x55555555u32,
+        0xAAAAAAAAu32,
+        0x55555555u32,
+        0xAAAAAAAAu32,
+        0x55555555u32,
+        0xAAAAAAAAu32,
+        0x55555555u32,
+        0xAAAAAAAAu32,
+        0x55555555u32,
+        0xAAAAAAAAu32,
+        0x55555555u32,
+        0xAAAAAAAAu32,
+        0x55555555u32,
+        0xAAAAAAAAu32,
+        0x55555555u32,
+        0xAAAAAAAAu32,
+        0x55555555u32,
+        0xAAAAAAAAu32,
+        0x55555555u32,
+        0xAAAAAAAAu32,
+        0x55555555u32,
+        0xAAAAAAAAu32,
+        0x55555555u32,
+        0xAAAAAAAAu32,
+        0x55555555u32,
+        0xAAAAAAAAu32,
+        0x55555555u32,
+        0xAAAAAAAAu32,
+        0x55555555u32,
+        0xAAAAAAAAu32,
+        0x55555555u32,
+        0xAAAAAAAAu32,
+        0x55555555u32,
+        0xAAAAAAAAu32,
+        0x55555555u32,
+        0xAAAAAAAAu32,
+        0x55555555u32,
+        0xAAAAAAAAu32,
+        0x55555555u32,
+        0xAAAAAAAAu32,
+        0x55555555u32,
+        0xAAAAAAAAu32,
+        0x55555555u32,
+        0xAAAAAAAAu32,
+        0x55555555u32,
+        0xAAAAAAAAu32,
+        0x55555555u32,
+        0xAAAAAAAAu32,
+    ]
+);
 test_ptx_warp!(
     tid,
     [
@@ -468,6 +682,63 @@ test_ptx_warp!(
     ]
 );
 test_ptx_warp!(
+    shfl_sync_up_dynamic_delta_b32_pred,
+    [
+        0u32, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23,
+        24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46,
+        47, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63, 1000, 0, 1, 2, 3, 4, 5,
+        6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29,
+        30, 1032, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47, 48, 49, 50, 51,
+        52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 1000, 1001, 1002, 1003, 1004, 1005, 1006, 1007,
+        1008, 1009, 1010, 1011, 1012, 1013, 1014, 1015, 1016, 1017, 1018, 1019, 1020, 1021, 1022,
+        1023, 1024, 1025, 1026, 1027, 1028, 1029, 1030, 0, 1032, 1033, 1034, 1035, 1036, 1037,
+        1038, 1039, 1040, 1041, 1042, 1043, 1044, 1045, 1046, 1047, 1048, 1049, 1050, 1051, 1052,
+        1053, 1054, 1055, 1056, 1057, 1058, 1059, 1060, 1061, 1062, 32,
+    ]
+);
+test_ptx_warp!(
+    shfl_sync_down_dynamic_delta_b32_pred,
+    [
+        0u32, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23,
+        24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46,
+        47, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63, 1, 2, 3, 4, 5, 6, 7, 8,
+        9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31,
+        1031, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47, 48, 49, 50, 51, 52, 53,
+        54, 55, 56, 57, 58, 59, 60, 61, 62, 63, 1063, 31, 1001, 1002, 1003, 1004, 1005, 1006, 1007,
+        1008, 1009, 1010, 1011, 1012, 1013, 1014, 1015, 1016, 1017, 1018, 1019, 1020, 1021, 1022,
+        1023, 1024, 1025, 1026, 1027, 1028, 1029, 1030, 1031, 63, 1033, 1034, 1035, 1036, 1037,
+        1038, 1039, 1040, 1041, 1042, 1043, 1044, 1045, 1046, 1047, 1048, 1049, 1050, 1051, 1052,
+        1053, 1054, 1055, 1056, 1057, 1058, 1059, 1060, 1061, 1062, 1063,
+    ]
+);
+test_ptx_warp!(
+    shfl_sync_bfly_dynamic_delta_b32_pred,
+    [
+        0u32, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23,
+        24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46,
+        47, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63, 1, 0, 3, 2, 5, 4, 7, 6,
+        9, 8, 11, 10, 13, 12, 15, 14, 17, 16, 19, 18, 21, 20, 23, 22, 25, 24, 27, 26, 29, 28, 31,
+        30, 33, 32, 35, 34, 37, 36, 39, 38, 41, 40, 43, 42, 45, 44, 47, 46, 49, 48, 51, 50, 53, 52,
+        55, 54, 57, 56, 59, 58, 61, 60, 63, 62, 31, 30, 29, 28, 27, 26, 25, 24, 23, 22, 21, 20, 19,
+        18, 17, 16, 15, 14, 13, 12, 11, 10, 9, 8, 7, 6, 5, 4, 3, 2, 1, 0, 63, 62, 61, 60, 59, 58,
+        57, 56, 55, 54, 53, 52, 51, 50, 49, 48, 47, 46, 45, 44, 43, 42, 41, 40, 39, 38, 37, 36, 35,
+        34, 33, 32,
+    ]
+);
+test_ptx_warp!(
+    shfl_sync_idx_dynamic_delta_b32_pred,
+    [
+        0u32, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+        0, 0, 0, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32,
+        32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
+        1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 33, 33, 33, 33, 33, 33, 33, 33, 33,
+        33, 33, 33, 33, 33, 33, 33, 33, 33, 33, 33, 33, 33, 33, 33, 33, 33, 33, 33, 33, 33, 33, 33,
+        31, 31, 31, 31, 31, 31, 31, 31, 31, 31, 31, 31, 31, 31, 31, 31, 31, 31, 31, 31, 31, 31, 31,
+        31, 31, 31, 31, 31, 31, 31, 31, 31, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63,
+        63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63, 63,
+    ]
+);
+test_ptx_warp!(
     shfl_sync_mode_b32,
     [
         9u32, 7u32, 8u32, 9u32, 21u32, 19u32, 20u32, 21u32, 33u32, 31u32, 32u32, 33u32, 45u32,
@@ -503,7 +774,26 @@ test_ptx_warp!(
     ]
 );
 test_ptx_warp!(
+    vote_any_nosync,
+    [
+        1u32, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
+        1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+        0, 0, 0, 0, 0
+    ]
+);
+test_ptx_warp!(
     vote_ballot,
+    [
+        0u32, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+        0, 0, 0, 4294967292, 4294967292, 4294967292, 4294967292, 4294967292, 4294967292,
+        4294967292, 4294967292, 4294967292, 4294967292, 4294967292, 4294967292, 4294967292,
+        4294967292, 4294967292, 4294967292, 4294967292, 4294967292, 4294967292, 4294967292,
+        4294967292, 4294967292, 4294967292, 4294967292, 4294967292, 4294967292, 4294967292,
+        4294967292, 4294967292, 4294967292, 4294967292, 4294967292
+    ]
+);
+test_ptx_warp!(
+    vote_ballot_nosync,
     [
         0u32, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
         0, 0, 0, 4294967292, 4294967292, 4294967292, 4294967292, 4294967292, 4294967292,
@@ -1082,6 +1372,32 @@ fn test_hip_assert<
     Ok(())
 }
 
+fn test_zluda32_assert<
+    Input: From<u8> + Debug + Copy + PartialEq,
+    Output: From<u8> + Debug + Copy + PartialEq + Default,
+>(
+    name: &str,
+    ptx_text: &str,
+    input: Option<&[Input]>,
+    output: &[Output],
+    block_dim_x: u32,
+) -> Result<(), Box<dyn error::Error>> {
+    let ast = ptx_parser::parse_module_checked(&*ptx_text).unwrap();
+    let name = CString::new(name)?;
+    let llvm_ir = pass::to_llvm_module(
+        ast,
+        pass::Attributes {
+            clock_rate: 2124000,
+        },
+        |_| {},
+    )
+    .unwrap();
+    let result = run_zluda32(name.as_c_str(), llvm_ir, input, output, block_dim_x)
+        .map_err(|err| DisplayError { err })?;
+    assert_eq!(result.as_slice(), output);
+    Ok(())
+}
+
 fn test_llvm_assert(
     name: &str,
     ptx_text: &str,
@@ -1098,12 +1414,16 @@ fn test_llvm_assert(
     .unwrap();
     let actual_ll = llvm_ir.llvm_ir.print_module_to_string();
     let actual_ll = actual_ll.to_str();
-    compare_llvm(name, actual_ll, expected_ll);
+    compare_llvm(name, actual_ll.trim(), expected_ll.trim());
 
     let expected_attributes_ll = read_test_file!(concat!("../ll/_attributes.ll"));
     let actual_attributes_ll = llvm_ir.attributes_ir.print_module_to_string();
     let actual_attributes_ll = actual_attributes_ll.to_str();
-    compare_llvm("_attributes", actual_attributes_ll, &expected_attributes_ll);
+    compare_llvm(
+        "_attributes",
+        actual_attributes_ll.trim(),
+        expected_attributes_ll.trim(),
+    );
     Ok(())
 }
 
@@ -1116,6 +1436,9 @@ fn compare_llvm(name: &str, actual_ll: &str, expected_ll: &str) {
             let output_file = output_dir.join(format!("{}.ll", name));
             let mut output_file = File::create(output_file).unwrap();
             output_file.write_all(actual_ll.as_bytes()).unwrap();
+            if !actual_ll.ends_with("\n") {
+                output_file.write_all(b"\n").unwrap();
+            }
         }
         let comparison = pretty_assertions::StrComparison::new(&expected_ll, &actual_ll);
         panic!("assertion failed: `(left == right)`\n\n{}", comparison);
@@ -1285,6 +1608,8 @@ fn run_hip<Input: From<u8> + Copy + Debug, Output: From<u8> + Copy + Debug + Def
             module.llvm_ir,
             ptx_impl,
             module.attributes_ir,
+            module.metadata,
+            module.metadata32,
             None,
         )
         .unwrap();
@@ -1349,6 +1674,163 @@ fn run_hip<Input: From<u8> + Copy + Debug, Output: From<u8> + Copy + Debug + Def
     Ok(result)
 }
 
+fn run_zluda32<Input: From<u8> + Copy + Debug, Output: From<u8> + Copy + Debug + Default>(
+    name: &CStr,
+    module: pass::Module,
+    input: Option<&[Input]>,
+    output: &[Output],
+    block_dim_x: u32,
+) -> Result<Vec<Output>, hipError_t> {
+    use hip_runtime_sys::*;
+    unsafe { hipInit(0) }.unwrap();
+    let mut result = vec![0u8.into(); output.len()];
+    {
+        let dev = 0;
+        let mut stream = unsafe { mem::zeroed() };
+        unsafe { hipStreamCreate(&mut stream) }.unwrap();
+        let mut dev_props = unsafe { mem::zeroed() };
+        unsafe { hipGetDevicePropertiesR0600(&mut dev_props, dev) }.unwrap();
+        let ptx_impl = module.linked_bitcode();
+        let elf_module = llvm_zluda::compile(
+            &module.context,
+            unsafe { CStr::from_ptr(dev_props.gcnArchName.as_ptr()) }
+                .to_str()
+                .unwrap(),
+            module.llvm_ir,
+            ptx_impl,
+            module.attributes_ir,
+            module.metadata,
+            module.metadata32,
+            None,
+        )
+        .unwrap();
+        let zluda32 = kernel_metadata::ModuleMetadata32Bit::read_object(&elf_module).unwrap();
+        assert_eq!(zluda32.explicit_args_size_align.len(), 1);
+        assert_eq!(
+            zluda32.explicit_args_size_align[0].0,
+            name.to_str().unwrap()
+        );
+        assert_eq!(zluda32.explicit_args_size_align[0].1.len(), 2);
+        let mut module = unsafe { mem::zeroed() };
+        unsafe { hipModuleLoadData(&mut module, elf_module.as_ptr() as _) }.unwrap();
+        let mut kernel = unsafe { mem::zeroed() };
+        unsafe { hipModuleGetFunction(&mut kernel, module, name.as_ptr()) }.unwrap();
+        let mut buffer = ptr::null_mut();
+        let argument_values = create_args32(&mut buffer, stream, zluda32, output, input);
+        let mut args = argument_values
+            .iter()
+            .map(|offset| std::ptr::from_ref(offset).cast::<u32>())
+            .collect::<Vec<_>>();
+        unsafe {
+            hipModuleLaunchKernel(
+                kernel,
+                1,
+                1,
+                1,
+                block_dim_x,
+                1,
+                1,
+                1024,
+                stream,
+                args.as_mut_ptr().cast(),
+                ptr::null_mut(),
+            )
+        }
+        .unwrap();
+        unsafe {
+            hipMemcpyAsync(
+                result.as_mut_ptr() as _,
+                buffer.add(argument_values[if input.is_some() { 1 } else { 0 }]),
+                output.len() * mem::size_of::<Output>(),
+                hipMemcpyKind::hipMemcpyDeviceToHost,
+                stream,
+            )
+        }
+        .unwrap();
+        unsafe { hipStreamSynchronize(stream) }.unwrap();
+        unsafe { hipFree(buffer) }.unwrap();
+        unsafe { hipModuleUnload(module) }.unwrap();
+    }
+    Ok(result)
+}
+
+fn create_args32<Input: From<u8> + Copy + Debug, Output: From<u8> + Copy + Debug + Default>(
+    buffer: &mut *mut c_void,
+    stream: hipStream_t,
+    zluda32: &ArchivedModuleMetadata32Bit,
+    output: &[Output],
+    input: Option<&[Input]>,
+) -> Vec<usize> {
+    use hip_runtime_sys::*;
+    let input_iter = input
+        .iter()
+        .map(|input| input.len() * mem::size_of::<Input>());
+    let output = iter::once(output.len() * mem::size_of::<Output>());
+    let globals = zluda32.globals.iter().map(|g| g.initializer.len());
+    let layouts = compute_layouts(input_iter.chain(output).chain(iter::once(0)).chain(globals))
+        .collect::<Vec<_>>();
+    let total_size = layouts.last().unwrap().0.size();
+    // allocate buffer
+    unsafe { hipMalloc(buffer, total_size) }.unwrap();
+    unsafe { hipMemset(*buffer, 0xff, total_size) }.unwrap();
+    let mut args = layouts
+        .into_iter()
+        .map(|(_, offset)| offset)
+        .collect::<Vec<_>>();
+    // set input
+    if let Some(input) = input {
+        unsafe {
+            hipMemcpyWithStream(
+                (*buffer).add(args[0]),
+                input.as_ptr() as _,
+                input.len() * mem::size_of::<Input>(),
+                hipMemcpyKind::hipMemcpyHostToDevice,
+                stream,
+            )
+        }
+        .unwrap();
+    }
+    // set hidden memory ptr
+    let buffer_arg_index = if input.is_some() { 2 } else { 1 };
+    args[buffer_arg_index] = *buffer as usize;
+    // set globals
+    for (offset, global) in args
+        .iter()
+        .skip(buffer_arg_index + 1)
+        .zip(zluda32.globals.iter())
+    {
+        unsafe {
+            hipMemcpyWithStream(
+                (*buffer).add(*offset),
+                global.initializer.as_ptr().cast(),
+                global.initializer.len(),
+                hipMemcpyKind::hipMemcpyHostToDevice,
+                stream,
+            )
+        }
+        .unwrap();
+    }
+    args
+}
+
+fn compute_layouts(sizes: impl Iterator<Item = usize>) -> impl Iterator<Item = (Layout, usize)> {
+    const ALIGN: usize = 128;
+    sizes.scan(
+        (Layout::from_size_align(ALIGN, ALIGN).unwrap(), 0usize),
+        |(layout, offset), size| {
+            if size == 0 {
+                return Some((*layout, 0));
+            }
+            let (new_layout, new_offset) = layout
+                .extend(Layout::from_size_align(size, ALIGN).unwrap())
+                .unwrap();
+            *layout = new_layout;
+            *offset = new_offset;
+            Some((*layout, *offset))
+        },
+    )
+}
+
 pub fn verify_symbols(test_name: &str, ctx: &llvm_zluda::utils::Context, elf_module: &[u8]) {
     // TODO: fix tests to not use public symbols for global arrays
     if [
@@ -1382,7 +1864,12 @@ pub fn verify_symbols(test_name: &str, ctx: &llvm_zluda::utils::Context, elf_mod
     let expected = [
         "_DYNAMIC".to_string(),
         test_name.to_string(),
+        //format!("{}.has_dyn_sized_stack", test_name),
+        //format!("{}.has_recursion", test_name),
         format!("{}.kd", test_name),
+        //format!("{}.num_agpr", test_name),
+        //format!("{}.num_vgpr", test_name),
+        //format!("{}.private_seg_size", test_name),
     ];
     if symbols != expected {
         panic!(

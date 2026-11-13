@@ -1,4 +1,14 @@
 use cuda_types::cusparse::*;
+use rocsparse_sys::*;
+use std::{ptr, sync::OnceLock};
+use unwrap_or::unwrap_ok_or;
+
+fn rocsparse() -> Result<&'static super::RocsparseVtable, rocsparse_error> {
+    static LOCK: OnceLock<Result<super::RocsparseVtable, rocsparse_error>> = OnceLock::new();
+    let unwrapped: &Result<super::RocsparseVtable, rocsparse_error> =
+        LOCK.get_or_init(|| unsafe { super::RocsparseVtable::new() });
+    unwrapped.as_ref().map_err(|x| *x)
+}
 
 #[cfg(debug_assertions)]
 pub(crate) fn unimplemented() -> cusparseStatus_t {
@@ -10,370 +20,243 @@ pub(crate) fn unimplemented() -> cusparseStatus_t {
     cusparseStatus_t::ERROR_NOT_SUPPORTED
 }
 
-// VEGA-PATCH 2026-06-30 sprint-rust-final-T15:42 worker-cublas+sparse:
-// Stub graceful per app reali (PyTorch capability probe, Blender/AutoCAD splash).
-// PyTorch ROCm/CUDA wheels chiamano cusparseCreate al import per "feature detect".
-// Senza questo, torch.cuda.is_available() ritorna False perche' check imports.
-// Path no-op: handle = Box leak, descr = Box leak. NO operazioni reali su matrici sparse.
-// Per SpMM/SpMV reali servirebbe rocsparse-sys binding (non esistente nel workspace).
-
-use std::ffi::c_char;
-use std::ptr;
-
-// Fake context (handle opaco). Box leak per pointer stabile, valid finche' cusparseDestroy free.
-#[repr(C)]
-struct FakeContext {
-    cookie: u64,
-    stream: *mut std::ffi::c_void,
-    pointer_mode: u32,
-}
-
-const COOKIE_CTX: u64 = 0x5350_4152_5345_4356; // "SPARSECV" in hex
-const COOKIE_MAT: u64 = 0x4D41_5444_4553_4352; // "MATDESCR"
-
-// VEGA-PATCH cusparse-1: cusparseCreate stub graceful → handle opaco non-null
-pub(crate) fn create(handle: *mut cusparseHandle_t) -> cusparseStatus_t {
-    if handle.is_null() {
-        return cusparseStatus_t::ERROR_INVALID_VALUE;
-    }
-    let ctx = Box::new(FakeContext {
-        cookie: COOKIE_CTX,
-        stream: ptr::null_mut(),
-        pointer_mode: 0, // HOST default
-    });
-    unsafe { *handle = Box::into_raw(ctx) as cusparseHandle_t; }
-    Ok(())
-}
-
-// VEGA-PATCH cusparse-2: cusparseDestroy stub graceful → free Box
-pub(crate) fn destroy(handle: cusparseHandle_t) -> cusparseStatus_t {
-    if handle.is_null() {
-        return cusparseStatus_t::ERROR_INVALID_VALUE;
-    }
-    unsafe {
-        let ctx = &*(handle as *const FakeContext);
-        if ctx.cookie != COOKIE_CTX {
-            return cusparseStatus_t::ERROR_INVALID_VALUE;
-        }
-        drop(Box::from_raw(handle as *mut FakeContext));
-    }
-    Ok(())
-}
-
-// VEGA-PATCH cusparse-3: cusparseGetVersion → riporta CUDA 11.8 (11800) come cublas
-pub(crate) fn get_version(
-    _handle: cusparseHandle_t,
-    version: *mut ::core::ffi::c_int,
-) -> cusparseStatus_t {
-    if version.is_null() {
-        return cusparseStatus_t::ERROR_INVALID_VALUE;
-    }
-    unsafe { *version = 11800; }
-    Ok(())
-}
-
-// VEGA-PATCH cusparse-4: cusparseGetProperty → versione MAJOR/MINOR/PATCH
-pub(crate) fn get_property(
-    type_: cuda_types::cusparse::libraryPropertyType,
-    value: *mut ::core::ffi::c_int,
-) -> cusparseStatus_t {
-    if value.is_null() {
-        return cusparseStatus_t::ERROR_INVALID_VALUE;
-    }
-    // MAJOR=0, MINOR=1, PATCH=2 nella libraryPropertyType nvidia
-    let v = match type_.0 {
-        0 => 11,  // MAJOR
-        1 => 8,   // MINOR
-        2 => 0,   // PATCH
-        _ => return cusparseStatus_t::ERROR_INVALID_VALUE,
-    };
-    unsafe { *value = v; }
-    Ok(())
-}
-
-// VEGA-PATCH cusparse-5: cusparseSetStream no-op (memorizza in fake ctx)
-pub(crate) fn set_stream(
-    handle: cusparseHandle_t,
-    stream_id: cudaStream_t,
-) -> cusparseStatus_t {
-    if handle.is_null() {
-        return cusparseStatus_t::ERROR_INVALID_VALUE;
-    }
-    unsafe {
-        let ctx = &mut *(handle as *mut FakeContext);
-        if ctx.cookie != COOKIE_CTX {
-            return cusparseStatus_t::ERROR_INVALID_VALUE;
-        }
-        // cudaStream_t = CUstream(*mut CUstream_st), accedo a .0 field
-        ctx.stream = stream_id.0 as *mut std::ffi::c_void;
-    }
-    Ok(())
-}
-
-// VEGA-PATCH cusparse-6: cusparseGetStream legge da fake ctx
-pub(crate) fn get_stream(
-    handle: cusparseHandle_t,
-    stream_id: *mut cudaStream_t,
-) -> cusparseStatus_t {
-    if handle.is_null() || stream_id.is_null() {
-        return cusparseStatus_t::ERROR_INVALID_VALUE;
-    }
-    unsafe {
-        let ctx = &*(handle as *const FakeContext);
-        if ctx.cookie != COOKIE_CTX {
-            return cusparseStatus_t::ERROR_INVALID_VALUE;
-        }
-        // cudaStream_t e' alias di CUstream (tuple struct); costruisco via field .0
-        (*stream_id).0 = ctx.stream as *mut _;
-    }
-    Ok(())
-}
-
-// VEGA-PATCH cusparse-7: cusparseSetPointerMode no-op (memorizza)
-pub(crate) fn set_pointer_mode(
-    handle: cusparseHandle_t,
-    mode: cusparsePointerMode_t,
-) -> cusparseStatus_t {
-    if handle.is_null() {
-        return cusparseStatus_t::ERROR_INVALID_VALUE;
-    }
-    unsafe {
-        let ctx = &mut *(handle as *mut FakeContext);
-        if ctx.cookie != COOKIE_CTX {
-            return cusparseStatus_t::ERROR_INVALID_VALUE;
-        }
-        ctx.pointer_mode = mode.0;
-    }
-    Ok(())
-}
-
-// VEGA-PATCH cusparse-8: cusparseGetPointerMode legge da fake ctx
-pub(crate) fn get_pointer_mode(
-    handle: cusparseHandle_t,
-    mode: *mut cusparsePointerMode_t,
-) -> cusparseStatus_t {
-    if handle.is_null() || mode.is_null() {
-        return cusparseStatus_t::ERROR_INVALID_VALUE;
-    }
-    unsafe {
-        let ctx = &*(handle as *const FakeContext);
-        if ctx.cookie != COOKIE_CTX {
-            return cusparseStatus_t::ERROR_INVALID_VALUE;
-        }
-        *mode = cusparsePointerMode_t(ctx.pointer_mode);
-    }
-    Ok(())
-}
-
-// MatDescr: stub graceful (storage minimo)
-#[repr(C)]
-struct FakeMatDescr {
-    cookie: u64,
-    mat_type: u32,
-    fill_mode: u32,
-    diag_type: u32,
-    index_base: u32,
-}
-
-// VEGA-PATCH cusparse-9: cusparseCreateMatDescr → Box leak descrittore opaco
-pub(crate) fn create_mat_descr(
-    descr_a: *mut cusparseMatDescr_t,
-) -> cusparseStatus_t {
-    if descr_a.is_null() {
-        return cusparseStatus_t::ERROR_INVALID_VALUE;
-    }
-    let d = Box::new(FakeMatDescr {
-        cookie: COOKIE_MAT,
-        mat_type: 0,  // GENERAL
-        fill_mode: 0, // LOWER
-        diag_type: 0, // NON_UNIT
-        index_base: 0, // ZERO
-    });
-    unsafe { *descr_a = Box::into_raw(d) as cusparseMatDescr_t; }
-    Ok(())
-}
-
-// VEGA-PATCH cusparse-10: cusparseDestroyMatDescr free Box
-pub(crate) fn destroy_mat_descr(
-    descr_a: cusparseMatDescr_t,
-) -> cusparseStatus_t {
-    if descr_a.is_null() {
-        return cusparseStatus_t::ERROR_INVALID_VALUE;
-    }
-    unsafe {
-        let d = &*(descr_a as *const FakeMatDescr);
-        if d.cookie != COOKIE_MAT {
-            return cusparseStatus_t::ERROR_INVALID_VALUE;
-        }
-        drop(Box::from_raw(descr_a as *mut FakeMatDescr));
-    }
-    Ok(())
-}
-
-// VEGA-PATCH cusparse-11: cusparseSetMatType no-op (memorizza)
-pub(crate) fn set_mat_type(
-    descr_a: cusparseMatDescr_t,
-    type_: cusparseMatrixType_t,
-) -> cusparseStatus_t {
-    if descr_a.is_null() {
-        return cusparseStatus_t::ERROR_INVALID_VALUE;
-    }
-    unsafe {
-        let d = &mut *(descr_a as *mut FakeMatDescr);
-        if d.cookie != COOKIE_MAT { return cusparseStatus_t::ERROR_INVALID_VALUE; }
-        d.mat_type = type_.0;
-    }
-    Ok(())
-}
-
-// VEGA-PATCH cusparse-12: cusparseSetMatFillMode no-op
-pub(crate) fn set_mat_fill_mode(
-    descr_a: cusparseMatDescr_t,
-    fill_mode: cusparseFillMode_t,
-) -> cusparseStatus_t {
-    if descr_a.is_null() {
-        return cusparseStatus_t::ERROR_INVALID_VALUE;
-    }
-    unsafe {
-        let d = &mut *(descr_a as *mut FakeMatDescr);
-        if d.cookie != COOKIE_MAT { return cusparseStatus_t::ERROR_INVALID_VALUE; }
-        d.fill_mode = fill_mode.0;
-    }
-    Ok(())
-}
-
-// VEGA-PATCH cusparse-13: cusparseSetMatDiagType no-op
-pub(crate) fn set_mat_diag_type(
-    descr_a: cusparseMatDescr_t,
-    diag_type: cusparseDiagType_t,
-) -> cusparseStatus_t {
-    if descr_a.is_null() {
-        return cusparseStatus_t::ERROR_INVALID_VALUE;
-    }
-    unsafe {
-        let d = &mut *(descr_a as *mut FakeMatDescr);
-        if d.cookie != COOKIE_MAT { return cusparseStatus_t::ERROR_INVALID_VALUE; }
-        d.diag_type = diag_type.0;
-    }
-    Ok(())
-}
-
-// VEGA-PATCH cusparse-14: cusparseSetMatIndexBase no-op
-pub(crate) fn set_mat_index_base(
-    descr_a: cusparseMatDescr_t,
-    base: cusparseIndexBase_t,
-) -> cusparseStatus_t {
-    if descr_a.is_null() {
-        return cusparseStatus_t::ERROR_INVALID_VALUE;
-    }
-    unsafe {
-        let d = &mut *(descr_a as *mut FakeMatDescr);
-        if d.cookie != COOKIE_MAT { return cusparseStatus_t::ERROR_INVALID_VALUE; }
-        d.index_base = base.0;
-    }
-    Ok(())
-}
-
-// VEGA-PATCH cusparse-15: get_error_name → C-string statica
-pub(crate) fn get_error_name(
+pub(crate) unsafe fn get_error_name(
     status: cuda_types::cusparse::cusparseStatus_t,
-) -> *const c_char {
-    let s: &'static [u8] = match status {
-        Ok(()) => b"CUSPARSE_STATUS_SUCCESS\0",
-        Err(e) => match e.0.get() {
-            1 => b"CUSPARSE_STATUS_NOT_INITIALIZED\0",
-            2 => b"CUSPARSE_STATUS_ALLOC_FAILED\0",
-            3 => b"CUSPARSE_STATUS_INVALID_VALUE\0",
-            4 => b"CUSPARSE_STATUS_ARCH_MISMATCH\0",
-            5 => b"CUSPARSE_STATUS_MAPPING_ERROR\0",
-            6 => b"CUSPARSE_STATUS_EXECUTION_FAILED\0",
-            7 => b"CUSPARSE_STATUS_INTERNAL_ERROR\0",
-            8 => b"CUSPARSE_STATUS_MATRIX_TYPE_NOT_SUPPORTED\0",
-            9 => b"CUSPARSE_STATUS_ZERO_PIVOT\0",
-            10 => b"CUSPARSE_STATUS_NOT_SUPPORTED\0",
-            11 => b"CUSPARSE_STATUS_INSUFFICIENT_RESOURCES\0",
-            _ => b"CUSPARSE_STATUS_UNKNOWN\0",
-        },
-    };
-    s.as_ptr() as *const c_char
+) -> *const ::core::ffi::c_char {
+    match status {
+        Ok(()) => c"CUSPARSE_STATUS_SUCCESS".as_ptr(),
+        Err(cusparseError_t::NOT_INITIALIZED) => c"CUSPARSE_STATUS_NOT_INITIALIZED".as_ptr(),
+        Err(cusparseError_t::ALLOC_FAILED) => c"CUSPARSE_STATUS_ALLOC_FAILED".as_ptr(),
+        Err(cusparseError_t::INVALID_VALUE) => c"CUSPARSE_STATUS_INVALID_VALUE".as_ptr(),
+        Err(cusparseError_t::ARCH_MISMATCH) => c"CUSPARSE_STATUS_ARCH_MISMATCH".as_ptr(),
+        Err(cusparseError_t::MAPPING_ERROR) => c"CUSPARSE_STATUS_MAPPING_ERROR".as_ptr(),
+        Err(cusparseError_t::EXECUTION_FAILED) => c"CUSPARSE_STATUS_EXECUTION_FAILED".as_ptr(),
+        Err(cusparseError_t::INTERNAL_ERROR) => c"CUSPARSE_STATUS_INTERNAL_ERROR".as_ptr(),
+        Err(cusparseError_t::MATRIX_TYPE_NOT_SUPPORTED) => {
+            c"CUSPARSE_STATUS_MATRIX_TYPE_NOT_SUPPORTED".as_ptr()
+        }
+        Err(cusparseError_t::ZERO_PIVOT) => c"CUSPARSE_STATUS_ZERO_PIVOT".as_ptr(),
+        Err(cusparseError_t::NOT_SUPPORTED) => c"CUSPARSE_STATUS_NOT_SUPPORTED".as_ptr(),
+        Err(cusparseError_t::INSUFFICIENT_RESOURCES) => {
+            c"CUSPARSE_STATUS_INSUFFICIENT_RESOURCES".as_ptr()
+        }
+        Err(_) => c"CUSPARSE_STATUS_INTERNAL_ERROR".as_ptr(),
+    }
 }
 
-// VEGA-PATCH cusparse-16: get_error_string (alias semantico get_error_name)
-pub(crate) fn get_error_string(
+pub(crate) unsafe fn get_error_string(
     status: cuda_types::cusparse::cusparseStatus_t,
-) -> *const c_char {
-    let s: &'static [u8] = match status {
-        Ok(()) => b"The operation completed successfully.\0",
-        Err(e) => match e.0.get() {
-            1 => b"The cuSPARSE library was not initialized.\0",
-            2 => b"Resource allocation failed.\0",
-            3 => b"An invalid value or parameter was used.\0",
-            4 => b"Architecture mismatch / function not supported on device.\0",
-            5 => b"GPU memory mapping error.\0",
-            6 => b"Execution failed on the GPU.\0",
-            7 => b"Internal cuSPARSE error.\0",
-            8 => b"Matrix type not supported.\0",
-            9 => b"Zero pivot encountered in factorization.\0",
-            10 => b"Operation not supported (ZLUDA cuSPARSE stub).\0",
-            11 => b"Insufficient resources.\0",
-            _ => b"Unknown cuSPARSE status.\0",
-        },
-    };
-    s.as_ptr() as *const c_char
+) -> *const ::core::ffi::c_char {
+    if cfg!(windows) && status.is_err() && status.err() == rocsparse().err().map(Into::into) {
+        return c"rocsparse.dll could not be found. Please install HIP SDK: https://zluda.readthedocs.io/latest/hip_sdk.html".as_ptr();
+    }
+    get_error_name(status)
 }
 
-// VEGA-PATCH cusparse-17: get_mat_type legge da fake descr (no piu' todo!())
-pub(crate) fn get_mat_type(
-    descr_a: cuda_types::cusparse::cusparseMatDescr_t,
-) -> cuda_types::cusparse::cusparseMatrixType_t {
-    if descr_a.is_null() {
-        return cusparseMatrixType_t(0); // GENERAL fallback
-    }
-    unsafe {
-        let d = &*(descr_a as *const FakeMatDescr);
-        if d.cookie != COOKIE_MAT { return cusparseMatrixType_t(0); }
-        cusparseMatrixType_t(d.mat_type)
-    }
+pub(crate) unsafe fn get_mat_index_base(descr_a: rocsparse_mat_descr) -> rocsparse_index_base {
+    let rocsparse = unwrap_ok_or!(
+        rocsparse(),
+        _,
+        return rocsparse_index_base::rocsparse_index_base_zero
+    );
+    rocsparse.rocsparse_get_mat_index_base(descr_a)
 }
 
-// VEGA-PATCH cusparse-18: get_mat_fill_mode (no piu' todo!())
-pub(crate) fn get_mat_fill_mode(
-    descr_a: cuda_types::cusparse::cusparseMatDescr_t,
-) -> cuda_types::cusparse::cusparseFillMode_t {
-    if descr_a.is_null() {
-        return cusparseFillMode_t(0);
-    }
-    unsafe {
-        let d = &*(descr_a as *const FakeMatDescr);
-        if d.cookie != COOKIE_MAT { return cusparseFillMode_t(0); }
-        cusparseFillMode_t(d.fill_mode)
-    }
+pub(crate) unsafe fn get_mat_type(descr: rocsparse_mat_descr) -> rocsparse_matrix_type {
+    let rocsparse = unwrap_ok_or!(
+        rocsparse(),
+        _,
+        return rocsparse_matrix_type::rocsparse_matrix_type_general
+    );
+    rocsparse.rocsparse_get_mat_type(descr)
 }
 
-// VEGA-PATCH cusparse-19: get_mat_diag_type (no piu' todo!())
-pub(crate) fn get_mat_diag_type(
-    descr_a: cuda_types::cusparse::cusparseMatDescr_t,
-) -> cuda_types::cusparse::cusparseDiagType_t {
-    if descr_a.is_null() {
-        return cusparseDiagType_t(0);
-    }
-    unsafe {
-        let d = &*(descr_a as *const FakeMatDescr);
-        if d.cookie != COOKIE_MAT { return cusparseDiagType_t(0); }
-        cusparseDiagType_t(d.diag_type)
-    }
+pub(crate) unsafe fn get_mat_fill_mode(descr: rocsparse_mat_descr) -> rocsparse_fill_mode {
+    let rocsparse = unwrap_ok_or!(
+        rocsparse(),
+        _,
+        return rocsparse_fill_mode::rocsparse_fill_mode_lower
+    );
+    rocsparse.rocsparse_get_mat_fill_mode(descr)
 }
 
-// VEGA-PATCH cusparse-20: get_mat_index_base (no piu' todo!())
-pub(crate) fn get_mat_index_base(
-    descr_a: cuda_types::cusparse::cusparseMatDescr_t,
-) -> cuda_types::cusparse::cusparseIndexBase_t {
-    if descr_a.is_null() {
-        return cusparseIndexBase_t(0);
-    }
-    unsafe {
-        let d = &*(descr_a as *const FakeMatDescr);
-        if d.cookie != COOKIE_MAT { return cusparseIndexBase_t(0); }
-        cusparseIndexBase_t(d.index_base)
-    }
+pub(crate) unsafe fn get_mat_diag_type(descr: rocsparse_mat_descr) -> rocsparse_diag_type {
+    let rocsparse = unwrap_ok_or!(
+        rocsparse(),
+        _,
+        return rocsparse_diag_type::rocsparse_diag_type_non_unit
+    );
+    rocsparse.rocsparse_get_mat_diag_type(descr)
+}
+
+pub(crate) unsafe fn create(context: *mut rocsparse_handle) -> rocsparse_status {
+    rocsparse()?.rocsparse_create_handle(context)
+}
+
+pub(crate) unsafe fn create_const_coo(
+    descr: *mut rocsparse_const_spmat_descr,
+    rows: i64,
+    cols: i64,
+    nnz: i64,
+    coo_row_ind: *const ::core::ffi::c_void,
+    coo_col_ind: *const ::core::ffi::c_void,
+    coo_values: *const ::core::ffi::c_void,
+    idx_type: rocsparse_indextype,
+    idx_base: rocsparse_index_base,
+    data_type: rocsparse_datatype,
+) -> rocsparse_status {
+    rocsparse()?.rocsparse_create_const_coo_descr(
+        descr,
+        rows,
+        cols,
+        nnz,
+        coo_row_ind as *const _,
+        coo_col_ind as *const _,
+        coo_values as *const _,
+        idx_type,
+        idx_base,
+        data_type,
+    )
+}
+
+pub(crate) unsafe fn create_const_dn_mat(
+    descr: *mut rocsparse_const_dnmat_descr,
+    rows: i64,
+    cols: i64,
+    ld: i64,
+    values: *const ::core::ffi::c_void,
+    data_type: rocsparse_datatype,
+    order: rocsparse_order,
+) -> rocsparse_status {
+    rocsparse()?.rocsparse_create_const_dnmat_descr(
+        descr,
+        rows,
+        cols,
+        ld,
+        values as *const _,
+        data_type,
+        order,
+    )
+}
+
+pub(crate) unsafe fn create_dn_mat(
+    descr: *mut rocsparse_dnmat_descr,
+    rows: i64,
+    cols: i64,
+    ld: i64,
+    values: *mut ::core::ffi::c_void,
+    data_type: rocsparse_datatype,
+    order: rocsparse_order,
+) -> rocsparse_status {
+    rocsparse()?.rocsparse_create_dnmat_descr(
+        descr,
+        rows,
+        cols,
+        ld,
+        values as *mut _,
+        data_type,
+        order,
+    )
+}
+
+pub(crate) unsafe fn destroy(context: rocsparse_handle) -> rocsparse_status {
+    rocsparse()?.rocsparse_destroy_handle(context)
+}
+
+pub(crate) unsafe fn destroy_dn_mat(descr: rocsparse_const_dnmat_descr) -> rocsparse_status {
+    rocsparse()?.rocsparse_destroy_dnmat_descr(descr)
+}
+
+pub(crate) unsafe fn destroy_sp_mat(descr: rocsparse_const_spmat_descr) -> rocsparse_status {
+    rocsparse()?.rocsparse_destroy_spmat_descr(descr)
+}
+
+pub(crate) unsafe fn sp_m_m_buffer_size(
+    handle: rocsparse_handle,
+    op_a: rocsparse_operation,
+    op_b: rocsparse_operation,
+    alpha: *const ::core::ffi::c_void,
+    mat_a: rocsparse_const_spmat_descr,
+    mat_b: rocsparse_const_dnmat_descr,
+    beta: *const ::core::ffi::c_void,
+    mat_c: rocsparse_dnmat_descr,
+    compute_type: rocsparse_datatype,
+    alg: rocsparse_spmm_alg,
+    buffer_size: *mut usize,
+) -> rocsparse_status {
+    rocsparse()?.rocsparse_spmm(
+        handle,
+        op_a,
+        op_b,
+        alpha,
+        mat_a,
+        mat_b,
+        beta,
+        mat_c,
+        compute_type,
+        alg,
+        rocsparse_spmm_stage::rocsparse_spmm_stage_buffer_size,
+        buffer_size,
+        ptr::null_mut(),
+    )
+}
+
+pub(crate) unsafe fn sp_m_m_preprocess(
+    handle: rocsparse_handle,
+    op_a: rocsparse_operation,
+    op_b: rocsparse_operation,
+    alpha: *const ::core::ffi::c_void,
+    mat_a: rocsparse_const_spmat_descr,
+    mat_b: rocsparse_const_dnmat_descr,
+    beta: *const ::core::ffi::c_void,
+    mat_c: rocsparse_dnmat_descr,
+    compute_type: rocsparse_datatype,
+    alg: rocsparse_spmm_alg,
+    external_buffer: *mut ::core::ffi::c_void,
+) -> rocsparse_status {
+    rocsparse()?.rocsparse_spmm(
+        handle,
+        op_a,
+        op_b,
+        alpha,
+        mat_a,
+        mat_b,
+        beta,
+        mat_c,
+        compute_type,
+        alg,
+        rocsparse_spmm_stage::rocsparse_spmm_stage_preprocess,
+        &mut 0,
+        external_buffer,
+    )
+}
+
+pub(crate) unsafe fn sp_m_m(
+    handle: rocsparse_handle,
+    op_a: rocsparse_operation,
+    op_b: rocsparse_operation,
+    alpha: *const ::core::ffi::c_void,
+    mat_a: rocsparse_const_spmat_descr,
+    mat_b: rocsparse_const_dnmat_descr,
+    beta: *const ::core::ffi::c_void,
+    mat_c: rocsparse_dnmat_descr,
+    compute_type: rocsparse_datatype,
+    alg: rocsparse_spmm_alg,
+    external_buffer: *mut ::core::ffi::c_void,
+) -> rocsparse_status {
+    rocsparse()?.rocsparse_spmm(
+        handle,
+        op_a,
+        op_b,
+        alpha,
+        mat_a,
+        mat_b,
+        beta,
+        mat_c,
+        compute_type,
+        alg,
+        rocsparse_spmm_stage::rocsparse_spmm_stage_compute,
+        &mut 0,
+        external_buffer,
+    )
 }

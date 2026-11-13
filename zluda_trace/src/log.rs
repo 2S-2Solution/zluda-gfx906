@@ -236,6 +236,7 @@ impl Write for WriteBuffer {
 pub(crate) enum CudaFunctionName {
     Normal(&'static str),
     Dark { guid: CUuuid, index: usize },
+    Nvapi(u32),
 }
 
 impl Display for CudaFunctionName {
@@ -257,6 +258,9 @@ impl Display for CudaFunctionName {
                     }
                 }
             }
+            CudaFunctionName::Nvapi(interface) => {
+                write!(f, "{{nvapi:{:#010x}}}", interface)
+            }
         }
     }
 }
@@ -277,6 +281,7 @@ pub(crate) enum ErrorEntry {
     ModuleParsingError(String),
     Lz4DecompressionFailure,
     ZstdDecompressionFailure(usize),
+    DeflateDecompressionFailure(io::Error),
     UnexpectedArgument {
         arg_name: &'static str,
         expected: Vec<UInt>,
@@ -334,6 +339,9 @@ impl From<dark_api::fatbin::FatbinError> for ErrorEntry {
             dark_api::fatbin::FatbinError::ZstdDecompressionFailure(c) => {
                 ErrorEntry::ZstdDecompressionFailure(c)
             }
+            dark_api::fatbin::FatbinError::DeflateDecompressionFailure(e) => {
+                ErrorEntry::DeflateDecompressionFailure(e)
+            }
         }
     }
 }
@@ -373,6 +381,7 @@ impl Display for ErrorEntry {
             ErrorEntry::NulInsideModuleText(e) => e.fmt(f),
             ErrorEntry::Lz4DecompressionFailure => write!(f, "LZ4 decompression failure"),
             ErrorEntry::ZstdDecompressionFailure(err_code) => write!(f, "Zstd decompression failure: {}", zstd_safe::get_error_name(*err_code)),
+            ErrorEntry::DeflateDecompressionFailure(err) => write!(f, "Deflate decompression failure: {}", err),
             ErrorEntry::UnexpectedBinaryField {
                                                                 field_name,
                                                                 expected,

@@ -1,6 +1,6 @@
-use super::BrachCondition;
+use super::BranchCondition;
 use super::Directive2;
-use super::Function2;
+use super::Function;
 use super::GlobalStringIdentResolver2;
 use super::ModeRegister;
 use super::SpirvWord;
@@ -750,14 +750,14 @@ fn create_control_flow_graph(
     let mut cfg = ControlFlowGraph::new();
     for directive in directives.iter() {
         match directive {
-            super::Directive2::Method(Function2 {
+            super::Directive2::Method(Function {
                 name,
                 body: Some(body),
-                is_kernel,
+                kernel_attributes,
                 ..
             }) => {
                 let (mut bb_state, mut body_iter) =
-                    BasicBlockState::new(&mut cfg, *name, body, *is_kernel)?;
+                    BasicBlockState::new(&mut cfg, *name, body, kernel_attributes.is_some())?;
                 while let Some(statement) = body_iter.next() {
                     match statement {
                         Statement::Instruction(ast::Instruction::Bra { arguments }) => {
@@ -782,14 +782,14 @@ fn create_control_flow_graph(
                         }
                         Statement::RetValue(..)
                         | Statement::Instruction(ast::Instruction::Ret { .. }) => {
-                            if !is_kernel {
+                            if kernel_attributes.is_none() {
                                 bb_state.record_ret(*name)?;
                             }
                         }
                         Statement::Label(label) => {
                             bb_state.start(*label);
                         }
-                        Statement::Conditional(BrachCondition {
+                        Statement::Conditional(BranchCondition {
                             if_true, if_false, ..
                         }) => {
                             bb_state.end(&[*if_true, *if_false]);
@@ -798,12 +798,18 @@ fn create_control_flow_graph(
                             let modes = get_modes(instruction);
                             bb_state.append(modes);
                         }
-                        Statement::FpModeRequired { ftz_f32, rnd_f32 } => {
-                            bb_state.append(InstructionModes::new(
-                                ast::ScalarType::F32,
-                                ftz_f32.map(DenormalMode::from_ftz),
-                                rnd_f32.map(RoundingMode::from_ast),
-                            ));
+                        Statement::FpModeRequired {
+                            ftz_f32,
+                            rnd_f32,
+                            ftz_f16f64,
+                            rnd_f16f64,
+                        } => {
+                            bb_state.append(InstructionModes {
+                                denormal_f32: ftz_f32.map(DenormalMode::from_ftz),
+                                rounding_f32: rnd_f32.map(RoundingMode::from_ast),
+                                denormal_f16f64: ftz_f16f64.map(DenormalMode::from_ftz),
+                                rounding_f16f64: rnd_f16f64.map(RoundingMode::from_ast),
+                            });
                         }
                         _ => {}
                     }
@@ -883,10 +889,10 @@ fn join_modes(
     let functions_exit_modes = directives
         .iter()
         .filter_map(|directive| match directive {
-            Directive2::Method(Function2 {
+            Directive2::Method(Function {
                 name,
                 body: None,
-                is_kernel: false,
+                kernel_attributes: None,
                 ..
             }) => {
                 let fn_bb = match cfg.basic_blocks.get(name) {
@@ -902,10 +908,10 @@ fn join_modes(
                 };
                 Some(Ok((*name, modes)))
             }
-            Directive2::Method(Function2 {
+            Directive2::Method(Function {
                 name,
                 body: Some(_),
-                is_kernel: false,
+                kernel_attributes: None,
                 ..
             }) => {
                 let ret_bb = cfg.functions_rets.get(name).unwrap();
@@ -963,11 +969,11 @@ fn apply_global_mode_controls(
         .into_iter()
         .map(|directive| {
             let (mut method, initial_mode) = match directive {
-                Directive2::Variable(..) | Directive2::Method(Function2 { body: None, .. }) => {
+                Directive2::Variable(..) | Directive2::Method(Function { body: None, .. }) => {
                     return Ok(directive);
                 }
                 Directive2::Method(
-                    mut method @ Function2 {
+                    mut method @ Function {
                         name,
                         body: Some(_),
                         ..
@@ -979,14 +985,18 @@ fn apply_global_mode_controls(
                         .ok_or_else(error_unreachable)?;
                     let denormal_mode = initial_mode.denormal.twin_mode;
                     let rounding_mode = initial_mode.rounding.twin_mode;
-                    method.flush_to_zero_f32 =
-                        denormal_mode.f32.ok_or_else(error_unreachable)?.to_ftz();
-                    method.flush_to_zero_f16f64 =
-                        denormal_mode.f16f64.ok_or_else(error_unreachable)?.to_ftz();
-                    method.rounding_mode_f32 =
-                        rounding_mode.f32.ok_or_else(error_unreachable)?.to_ast();
-                    method.rounding_mode_f16f64 =
-                        rounding_mode.f16f64.ok_or_else(error_unreachable)?.to_ast();
+
+                    if let Some(kernel_attrs) = &mut method.kernel_attributes {
+                        kernel_attrs.flush_to_zero_f32 =
+                            denormal_mode.f32.ok_or_else(error_unreachable)?.to_ftz();
+                        kernel_attrs.flush_to_zero_f16f64 =
+                            denormal_mode.f16f64.ok_or_else(error_unreachable)?.to_ftz();
+                        kernel_attrs.rounding_mode_f32 =
+                            rounding_mode.f32.ok_or_else(error_unreachable)?.to_ast();
+                        kernel_attrs.rounding_mode_f16f64 =
+                            rounding_mode.f16f64.ok_or_else(error_unreachable)?.to_ast();
+                    }
+
                     (method, initial_mode)
                 }
             };
@@ -1013,7 +1023,7 @@ fn apply_global_mode_controls(
                         bb_state.redirect_jump(func)?;
                         call_target = Some(*func);
                     }
-                    Statement::Conditional(BrachCondition {
+                    Statement::Conditional(BranchCondition {
                         if_true, if_false, ..
                     }) => {
                         bb_state.redirect_jump(if_true)?;
@@ -1028,14 +1038,20 @@ fn apply_global_mode_controls(
                         let modes = get_modes(&instruction);
                         bb_state.insert(&mut result, modes)?;
                     }
-                    Statement::FpModeRequired { ftz_f32, rnd_f32 } => {
+                    Statement::FpModeRequired {
+                        ftz_f32,
+                        rnd_f32,
+                        ftz_f16f64,
+                        rnd_f16f64,
+                    } => {
                         bb_state.insert(
                             &mut result,
-                            InstructionModes::new(
-                                ast::ScalarType::F32,
-                                ftz_f32.map(DenormalMode::from_ftz),
-                                rnd_f32.map(RoundingMode::from_ast),
-                            ),
+                            InstructionModes {
+                                denormal_f32: ftz_f32.map(DenormalMode::from_ftz),
+                                rounding_f32: rnd_f32.map(RoundingMode::from_ast),
+                                denormal_f16f64: ftz_f16f64.map(DenormalMode::from_ftz),
+                                rounding_f16f64: rnd_f16f64.map(RoundingMode::from_ast),
+                            },
                         )?;
                     }
                     _ => {}
@@ -1072,7 +1088,7 @@ fn apply_global_mode_controls(
 }
 
 fn check_function_prelude(
-    method: &Function2<ast::Instruction<SpirvWord>, SpirvWord>,
+    method: &Function<ast::Instruction<SpirvWord>, SpirvWord>,
     global_modes: &FullModeInsertion,
 ) -> Result<(), TranslateError> {
     let fn_mode_state = global_modes
@@ -2128,21 +2144,20 @@ fn get_modes<T: ast::Operand>(inst: &ast::Instruction<T>) -> InstructionModes {
         | ast::Instruction::Not { .. }
         | ast::Instruction::Or { .. }
         | ast::Instruction::And { .. }
-        | ast::Instruction::AddCarry { .. }
-        | ast::Instruction::MadCarry { .. }
         | ast::Instruction::Bra { .. }
         | ast::Instruction::Clz { .. }
         | ast::Instruction::Bfind { .. }
         | ast::Instruction::Brev { .. }
         | ast::Instruction::Dp4a { .. }
-        | ast::Instruction::Vshr { .. }
         | ast::Instruction::Popc { .. }
         | ast::Instruction::Xor { .. }
         | ast::Instruction::Rem { .. }
         | ast::Instruction::Bfe { .. }
         | ast::Instruction::Bfi { .. }
+        | ast::Instruction::Bmsk { .. }
         | ast::Instruction::Shr { .. }
-        | ast::Instruction::ShflSync { .. }
+        | ast::Instruction::Shfl { .. }
+        | ast::Instruction::MatchSync { .. }
         | ast::Instruction::CpAsync { .. }
         | ast::Instruction::CpAsyncCommitGroup { .. }
         | ast::Instruction::CpAsyncWaitGroup { .. }
@@ -2167,11 +2182,19 @@ fn get_modes<T: ast::Operand>(inst: &ast::Instruction<T>) -> InstructionModes {
         | ast::Instruction::Mma { .. }
         | ast::Instruction::Prefetch { .. }
         | ast::Instruction::CreatePolicyFractional { .. }
+        | ast::Instruction::Dp2a { .. }
+        | ast::Instruction::Sad { .. }
+        | ast::Instruction::Tex { .. }
+        | ast::Instruction::Suld { .. }
+        | ast::Instruction::Sust { .. }
         | ast::Instruction::Copysign { .. } => InstructionModes::none(),
         ast::Instruction::Add {
             data: ast::ArithDetails::Integer(_),
             ..
         }
+        | ast::Instruction::AddExtended { .. }
+        | ast::Instruction::SubExtended { .. }
+        | ast::Instruction::MadExtended { .. }
         | ast::Instruction::Sub {
             data: ast::ArithDetails::Integer(..),
             ..
@@ -2195,7 +2218,8 @@ fn get_modes<T: ast::Operand>(inst: &ast::Instruction<T>) -> InstructionModes {
         | ast::Instruction::Div {
             data: ast::DivDetails::Signed(..) | ast::DivDetails::Unsigned(..),
             ..
-        } => InstructionModes::none(),
+        }
+        | ast::Instruction::Vshr { .. } => InstructionModes::none(),
         ast::Instruction::Fma { data, .. }
         | ast::Instruction::Sub {
             data: ast::ArithDetails::Float(data),

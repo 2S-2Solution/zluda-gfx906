@@ -13,10 +13,10 @@ pub type cudaGraphExecUpdateResultInfo_st = super::cuda::CUgraphExecUpdateResult
 pub type cudaAsyncNotificationType = super::cuda::CUasyncNotificationType_enum;
 pub type cudaGraph_t = super::cuda::CUgraph;
 pub const CUFFT_VER_MAJOR: u32 = 12;
-pub const CUFFT_VER_MINOR: u32 = 0;
+pub const CUFFT_VER_MINOR: u32 = 1;
 pub const CUFFT_VER_PATCH: u32 = 0;
-pub const CUFFT_VER_BUILD: u32 = 61;
-pub const CUFFT_VERSION: u32 = 12000;
+pub const CUFFT_VER_BUILD: u32 = 31;
+pub const CUFFT_VERSION: u32 = 12100;
 pub const CUFFT_FORWARD: i32 = -1;
 pub const CUFFT_INVERSE: u32 = 1;
 pub const CUFFT_PLAN_NULL: i32 = -1;
@@ -86,7 +86,9 @@ impl cufftCompatibility_t {
 #[derive(Debug, Copy, Clone, Hash, PartialEq, Eq)]
 pub struct cufftCompatibility_t(pub ::core::ffi::c_uint);
 pub use self::cufftCompatibility_t as cufftCompatibility;
-pub type cufftHandle = ::core::ffi::c_int;
+#[repr(transparent)]
+#[derive(Debug, Copy, Clone, Hash, PartialEq, Eq)]
+pub struct cufftHandle(pub ::core::ffi::c_int);
 impl cufftProperty_t {
     pub const NVFFT_PLAN_PROPERTY_INT64_PATIENT_JIT: cufftProperty_t = cufftProperty_t(
         1,
@@ -484,3 +486,9 @@ pub type cufftResult = ::core::result::Result<(), cufftError_t>;
 const _: fn() = || {
     let _ = std::mem::transmute::<cufftResult, u32>;
 };
+
+impl From<hipfft_sys::hipfftError> for cufftError_t {
+    fn from(error: hipfft_sys::hipfftError) -> Self {
+        Self(error.0)
+    }
+}

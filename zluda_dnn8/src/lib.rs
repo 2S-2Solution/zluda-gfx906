@@ -16,6 +16,14 @@ cuda_macros::cudnn8_function_declarations! {
 #[cfg(windows)]
 mod windows {
     use zluda_windows;
+
+    #[no_mangle]
+    static __pfnDliNotifyHook2: zluda_windows::PfnDliHook =
+        zluda_windows::open_already_loaded_amdhip;
+
+    // 2 Solution (gfx906): zluda_dnn calls MIOpen directly (miopen-sys with raw-dylib), so
+    // MIOpen.dll stays delay-loaded as before the merge, with this fallback when the normal
+    // search fails (see zluda_windows::try_load_from_self_or_hip).
     #[no_mangle]
     static __pfnDliFailureHook2: zluda_windows::PfnDliHook = delaylink_hook;
 
@@ -23,7 +31,7 @@ mod windows {
         dli_notify: u32,
         pdli: *const zluda_windows::DelayLoadInfo,
     ) -> *mut std::ffi::c_void {
-        zluda_windows::delay_load_failure_hook("MIOpen.dll", dli_notify, pdli)
+        zluda_windows::delay_load_failure_hook("MIOpen.dll", None, dli_notify, pdli)
             .map(|hm| hm.0 as *mut std::ffi::c_void)
             .unwrap_or(std::ptr::null_mut())
     }

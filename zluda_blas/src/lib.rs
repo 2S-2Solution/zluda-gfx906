@@ -1,6 +1,6 @@
-mod r#impl;
-
 use cuda_types::cublas::cublasError_t;
+
+mod r#impl;
 
 macro_rules! unimplemented {
     ($($abi:literal fn $fn_name:ident( $($arg_id:ident : $arg_type:ty),* ) -> $ret_type:ty;)*) => {
@@ -8,6 +8,7 @@ macro_rules! unimplemented {
             #[cfg_attr(not(test), no_mangle)]
             #[allow(improper_ctypes)]
             #[allow(improper_ctypes_definitions)]
+            #[allow(unused_variables)]
             pub unsafe extern $abi fn $fn_name ( $( $arg_id : $arg_type),* ) -> $ret_type {
                 crate::r#impl::unimplemented()
             }
@@ -111,20 +112,68 @@ cuda_macros::cublas_function_declarations!(
 //      b) cast i64→i32 e chiamano la gemm_strided_batched_ex / gemm_ex esistente
 //   Vedi blocco commentato a fine file per il codice impl pronto.
 
-#[cfg(windows)]
-mod windows {
-    use zluda_windows;
-    #[no_mangle]
-    static __pfnDliFailureHook2: zluda_windows::PfnDliHook = delaylink_hook;
+macro_rules! noop {
+    ($($abi:literal fn $fn_name:ident( $($arg_id:ident : $arg_type:ty),* ) -> $ret_type:ty;)*) => {};
+}
 
-    unsafe extern "system" fn delaylink_hook(
-        dli_notify: u32,
-        pdli: *const zluda_windows::DelayLoadInfo,
-    ) -> *mut std::ffi::c_void {
-        zluda_windows::delay_load_failure_hook("rocblas.dll", dli_notify, pdli)
-            .map(|hm| hm.0 as *mut std::ffi::c_void)
-            .unwrap_or(std::ptr::null_mut())
+#[cfg(windows)]
+mod os_macro {
+    macro_rules! vtable_impl {
+        ($($abi:literal fn $fn_name:ident( $($arg_id:ident : $arg_type:ty),* ) -> $ret_type:ty;)*) => {
+            use rocblas_sys::*;
+            struct RocblasVtable {
+                _lib: libloading::os::windows::Library,
+                $($fn_name: unsafe extern "C" fn($($arg_id: $arg_type),*) -> $ret_type,)*
+            }
+
+            impl RocblasVtable {
+                pub unsafe fn new() -> Result<Self, rocblas_error> {
+                    let hmodule = zluda_windows::try_load_from_self_or_hip_with_message(&["rocblas.dll"]).ok_or(rocblas_error::internal_error)?;
+                    let lib = libloading::os::windows::Library::from_raw(hmodule.0 as _);
+                    $(
+                        let $fn_name = *lib.get::<unsafe extern "C" fn($($arg_id: $arg_type),*) -> $ret_type>(concat!(stringify!($fn_name), "\0").as_bytes()).map_err(|_| rocblas_error::internal_error)?;
+                    )*
+                    Ok(Self {
+                        _lib: lib,
+                        $($fn_name,)*
+                    })
+                }
+
+                $(
+                    pub unsafe fn $fn_name(&self, $($arg_id: $arg_type),*) -> $ret_type {
+                        (self.$fn_name)($($arg_id),*)
+                    }
+                )*
+            }
+        };
     }
+    pub(crate) use vtable_impl;
+}
+
+#[cfg(not(windows))]
+mod os_macro {
+    macro_rules! vtable_impl {
+        ($($abi:literal fn $fn_name:ident( $($arg_id:ident : $arg_type:ty),* ) -> $ret_type:ty;)*) => {
+            use rocblas_sys::*;
+
+            struct RocblasVtable {}
+
+            impl RocblasVtable {
+                pub unsafe fn new() -> Result<Self, rocblas_error> {
+                    Ok(Self {})
+                }
+            }
+
+            impl RocblasVtable {
+                $(
+                    pub unsafe fn $fn_name(&self, $($arg_id: $arg_type),*) -> $ret_type {
+                        (rocblas_sys::$fn_name)($($arg_id),*)
+                    }
+                )*
+            }
+        };
+    }
+    pub(crate) use vtable_impl;
 }
 
 
@@ -167,5 +216,47 @@ pub(crate) fn diag_dir() -> std::path::PathBuf {
     match std::env::var_os("ZLUDA_DIAG_DIR") {
         Some(d) => std::path::PathBuf::from(d),
         None => std::env::temp_dir().join("zluda_diag"),
+    }
+}
+
+cuda_macros::rocblas_function_declarations!(
+    noop,
+    os_macro::vtable_impl
+        <= [
+            rocblas_create_handle,
+            rocblas_destroy_handle,
+            rocblas_gemm_batched_ex,
+            rocblas_gemm_ex,
+            rocblas_gemm_strided_batched_ex,
+            rocblas_get_math_mode,
+            rocblas_get_vector,
+            rocblas_hgemm,
+            rocblas_set_math_mode,
+            rocblas_set_pointer_mode,
+            rocblas_set_stream,
+            rocblas_set_vector,
+            rocblas_set_workspace,
+            rocblas_sgemm_strided_batched,
+            rocblas_sgemm,
+        ]
+);
+
+#[cfg(test)]
+mod tests;
+
+// 2 Solution (gfx906): fallback when the normal search for the delay-loaded rocblas.dll fails
+// (see zluda_windows::try_load_from_self_or_hip).
+#[cfg(windows)]
+mod delay_load_hook {
+    #[no_mangle]
+    static __pfnDliFailureHook2: zluda_windows::PfnDliHook = delaylink_hook;
+
+    unsafe extern "system" fn delaylink_hook(
+        dli_notify: u32,
+        pdli: *const zluda_windows::DelayLoadInfo,
+    ) -> *mut std::ffi::c_void {
+        zluda_windows::delay_load_failure_hook("rocblas.dll", None, dli_notify, pdli)
+            .map(|hm| hm.0 as *mut std::ffi::c_void)
+            .unwrap_or(std::ptr::null_mut())
     }
 }

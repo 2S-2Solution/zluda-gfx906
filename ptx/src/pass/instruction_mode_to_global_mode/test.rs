@@ -98,7 +98,10 @@ fn transitive_change_twice() {
 
     let result =
         optimize_mode_insertions::<DenormalMode, { DenormalMode::COUNT }>(partial_result).unwrap();
-    assert_eq!(result.basic_blocks, iter::once(true_id).collect());
+    assert_eq!(
+        result.basic_blocks,
+        iter::once(true_id).collect::<FxHashSet<_>>()
+    );
     assert_eq!(result.kernels.len(), 1);
     assert_eq!(result.kernels[&entry_id], DenormalMode::FlushToZero);
 }
@@ -187,8 +190,9 @@ static FOLD_DENORMAL_PTX: &'static str = include_str!("fold_denormal.ptx");
 #[test]
 fn fold_denormal() {
     let method = compile_methods(FOLD_DENORMAL_PTX).pop().unwrap();
-    assert_eq!(true, method.flush_to_zero_f32);
-    assert_eq!(true, method.flush_to_zero_f16f64);
+    let kernel_attrs = method.kernel_attributes.expect("method should be a kernel");
+    assert_eq!(true, kernel_attrs.flush_to_zero_f32);
+    assert_eq!(true, kernel_attrs.flush_to_zero_f16f64);
     let method_body = method.body.unwrap();
     assert!(matches!(
         &*method_body,
@@ -210,14 +214,14 @@ fn fold_denormal() {
     ));
 }
 
-fn compile_methods(ptx: &str) -> Vec<Function2<ast::Instruction<SpirvWord>, SpirvWord>> {
+fn compile_methods(ptx: &str) -> Vec<Function<ast::Instruction<SpirvWord>, SpirvWord>> {
     use crate::pass::*;
 
     let module = ptx_parser::parse_module_checked(ptx).unwrap();
     let mut flat_resolver = GlobalStringIdentResolver2::new(SpirvWord(1));
     let mut scoped_resolver = ScopedResolver::new(&mut flat_resolver);
     let directives = normalize_identifiers::run(&mut scoped_resolver, module.directives).unwrap();
-    let directives = normalize_predicates2::run(&mut flat_resolver, directives).unwrap();
+    let directives = normalize_predicates::run(&mut flat_resolver, directives).unwrap();
     let directives = expand_operands::run(&mut flat_resolver, directives).unwrap();
     let directives = normalize_basic_blocks::run(&mut flat_resolver, directives).unwrap();
     let directives = super::run(&mut flat_resolver, directives).unwrap();
@@ -409,7 +413,7 @@ fn conditionals<const N: usize>(
 ) -> [(SpirvWord, SpirvWord); N] {
     fn_.iter()
         .filter_map(|s| match s {
-            Statement::Conditional(BrachCondition {
+            Statement::Conditional(BranchCondition {
                 if_true, if_false, ..
             }) => Some((*if_true, *if_false)),
             _ => None,

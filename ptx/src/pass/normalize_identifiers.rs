@@ -46,19 +46,21 @@ fn run_method<'input, 'b>(
         })
         .transpose()?;
     resolver.end_scope();
-    Ok(Function2 {
+    Ok(Function {
         return_arguments,
         name,
         input_arguments,
         body,
         import_as: None,
         linkage,
-        is_kernel,
+        kernel_attributes: is_kernel.then(|| KernelAttributes {
+            flush_to_zero_f32: false,
+            flush_to_zero_f16f64: false,
+            rounding_mode_f32: ptx_parser::RoundingMode::NearestEven,
+            rounding_mode_f16f64: ptx_parser::RoundingMode::NearestEven,
+        }),
         tuning: method.tuning,
-        flush_to_zero_f32: false,
-        flush_to_zero_f16f64: false,
-        rounding_mode_f32: ptx_parser::RoundingMode::NearestEven,
-        rounding_mode_f16f64: ptx_parser::RoundingMode::NearestEven,
+        kernel_meta32: None,
     })
 }
 

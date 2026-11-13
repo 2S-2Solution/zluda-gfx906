@@ -9,8 +9,7 @@ use syn::parse::{Parse, ParseStream};
 use syn::punctuated::Punctuated;
 use syn::visit_mut::VisitMut;
 use syn::{
-    bracketed, parse_macro_input, File, ForeignItem, ForeignItemFn, Ident, Item, Path, Signature,
-    Token
+    File, ForeignItem, ForeignItemFn, Ident, Item, PatType, Path, Signature, Token, TypeGroup, bracketed, parse_macro_input
 };
 
 const CUDA_RS: &'static str = include_str! {"cuda.rs"};
@@ -22,6 +21,11 @@ const CUFFT_RS: &'static str = include_str! {"cufft.rs"};
 const CUSPARSE_RS: &'static str = include_str! {"cusparse.rs"};
 const CUDNN8_RS: &'static str = include_str! {"cudnn8.rs"};
 const CUDNN9_RS: &'static str = include_str! {"cudnn9.rs"};
+const ROCBLAS_RS: &'static str = include_str! {"../../ext/rocblas-sys/src/lib.rs"};
+const ROCSPARSE_RS: &'static str = include_str! {"../../ext/rocsparse-sys/src/lib.rs"};
+const HIPBLASLT_RS: &'static str = include_str! {"../../ext/hipblaslt-sys/src/lib.rs"};
+const MIOPEN_RS: &'static str = include_str! {"../../ext/miopen-sys/src/lib.rs"};
+const HIPFFT_RS: &'static str = include_str! {"../../ext/hipfft-sys/src/lib.rs"};
 
 // This macro accepts following arguments:
 // * `normal_macro`: ident for a normal macro
@@ -39,45 +43,70 @@ const CUDNN9_RS: &'static str = include_str! {"cudnn9.rs"};
 // Additionally, it does a fixup of CUDA types so they get prefixed with `type_path`
 #[proc_macro]
 pub fn cuda_function_declarations(tokens: TokenStream) -> TokenStream {
-    function_declarations(tokens, CUDA_RS)
+    function_declarations(tokens, CUDA_RS, false)
 }
 
 #[proc_macro]
 pub fn cublas_function_declarations(tokens: TokenStream) -> TokenStream {
-    function_declarations(tokens, CUBLAS_RS)
+    function_declarations(tokens, CUBLAS_RS, false)
 }
 
 #[proc_macro]
 pub fn cublaslt_function_declarations(tokens: TokenStream) -> TokenStream {
-    function_declarations(tokens, CUBLASLT_RS)
+    function_declarations(tokens, CUBLASLT_RS, false)
 }
 
 #[proc_macro]
 pub fn cublaslt_internal_function_declarations(tokens: TokenStream) -> TokenStream {
-    function_declarations(tokens, CUBLASLT_INTERNAL_RS)
+    function_declarations(tokens, CUBLASLT_INTERNAL_RS, false)
 }
 
 #[proc_macro]
 pub fn cufft_function_declarations(tokens: TokenStream) -> TokenStream {
-    function_declarations(tokens, CUFFT_RS)
+    function_declarations(tokens, CUFFT_RS, false)
 }
 
 #[proc_macro]
 pub fn cusparse_function_declarations(tokens: TokenStream) -> TokenStream {
-    function_declarations(tokens, CUSPARSE_RS)
+    function_declarations(tokens, CUSPARSE_RS, false)
 }
 
 #[proc_macro]
 pub fn cudnn8_function_declarations(tokens: TokenStream) -> TokenStream {
-    function_declarations(tokens, CUDNN8_RS)
+    function_declarations(tokens, CUDNN8_RS, false)
 }
 
 #[proc_macro]
 pub fn cudnn9_function_declarations(tokens: TokenStream) -> TokenStream {
-    function_declarations(tokens, CUDNN9_RS)
+    function_declarations(tokens, CUDNN9_RS, false)
 }
 
-fn function_declarations(tokens: TokenStream, module: &str) -> TokenStream {
+#[proc_macro]
+pub fn rocblas_function_declarations(tokens: TokenStream) -> TokenStream {
+    function_declarations(tokens, ROCBLAS_RS, true)
+}
+
+#[proc_macro]
+pub fn rocsparse_function_declarations(tokens: TokenStream) -> TokenStream {
+    function_declarations(tokens, ROCSPARSE_RS, true)
+}
+
+#[proc_macro]
+pub fn hipfft_function_declarations(tokens: TokenStream) -> TokenStream {
+    function_declarations(tokens, HIPFFT_RS, true)
+}
+
+#[proc_macro]
+pub fn hipblaslt_function_declarations(tokens: TokenStream) -> TokenStream {
+    function_declarations(tokens, HIPBLASLT_RS, true)
+}
+
+#[proc_macro]
+pub fn miopen_function_declarations(tokens: TokenStream) -> TokenStream {
+    function_declarations(tokens, MIOPEN_RS, true)
+}
+
+fn function_declarations(tokens: TokenStream, module: &str, relaxed: bool) -> TokenStream {
     let input = parse_macro_input!(tokens as FnDeclInput);
     let mut cuda_module = syn::parse_str::<File>(module).unwrap();
     let mut choose_macro = ChooseMacro::new(input);
@@ -85,17 +114,32 @@ fn function_declarations(tokens: TokenStream, module: &str) -> TokenStream {
     for item in cuda_module.items {
         let extern_ = if let Item::ForeignMod(extern_) = item {
             extern_
+        } else if relaxed {
+            continue;
         } else {
             unreachable!()
         };
         let abi = extern_.abi.name;
         for mut item in extern_.items {
             if let ForeignItem::Fn(ForeignItemFn {
-                sig: Signature { ref ident, .. },
+                sig: Signature { ref ident, ref mut output, ref variadic, .. },
                 ref mut attrs,
+                ref mut vis,
                 ..
             }) = item
             {
+                if relaxed {
+                    if variadic.is_some() {
+                        continue;
+                    }
+                    *vis = syn::Visibility::Inherited;
+                    if output == &syn::ReturnType::Default {
+                        *output = syn::ReturnType::Type(
+                            Token![->](Span::call_site()),
+                            Box::new(syn::parse_quote! { () }),
+                        );
+                    }
+                }
                 *attrs = Vec::new();
                 choose_macro.add(ident, quote! { #abi #item });
             } else {
@@ -120,7 +164,7 @@ fn function_declarations(tokens: TokenStream, module: &str) -> TokenStream {
 
 #[proc_macro]
 pub fn nvml_function_declarations(tokens: TokenStream) -> TokenStream {
-    function_declarations(tokens, NVML_RS)
+    function_declarations(tokens, NVML_RS, false)
 }
 struct FnDeclInput {
     normal_macro: Path,
@@ -205,8 +249,8 @@ impl VisitMut for FixFnSignatures {
 }
 
 const MODULES: &[&str] = &[
-    "context", "device", "driver", "event", "function", "graph", "kernel",
-    "library", "link", "memory", "module", "pointer", "stream"
+    "array", "context", "d3d11", "device", "driver", "event", "function", "graph", "graphics", "kernel",
+    "library", "link", "memory", "module", "pointer", "stream", "tex", "surf"
 ];
 
 fn normalize_fn_impl(
@@ -258,13 +302,126 @@ pub fn cusparse_normalize_fn(tokens: TokenStream) -> TokenStream {
 }
 
 #[proc_macro]
+pub fn cufft_normalize_fn(tokens: TokenStream) -> TokenStream {
+    normalize_fn_impl("cufft", None, tokens)
+}
+
+#[proc_macro]
 pub fn nvml_normalize_fn(tokens: TokenStream) -> TokenStream {
     normalize_fn_impl("nvml", None, tokens)
 }
 
+#[proc_macro]
+pub fn generate_input_struct(tokens: TokenStream) -> TokenStream {
+    let input = parse_macro_input!(tokens as FnWithFields);
+    let struct_name = format_ident!("{}In", input.fn_name);
+    let fields = input.fields.iter().filter(|pat| is_input_field(&pat.ty)).map(use_wire_object);
+    quote! {
+        #[derive(Archive, Deserialize, Serialize, Debug, PartialEq)]
+        #[repr(C)]
+        pub struct #struct_name {
+            #(#fields),*
+        }
+        unsafe impl Portable for #struct_name {}
+    }.into()
+}
+
+#[proc_macro]
+pub fn generate_output_struct(tokens: TokenStream) -> TokenStream {
+    let input = parse_macro_input!(tokens as FnWithFields);
+    let struct_name = format_ident!("{}Out", input.fn_name);
+    let fields = input.fields.iter().filter(|pat| !is_input_field(&pat.ty)).map(strip_mut_ptr);
+    quote! {
+        #[derive(Archive, Deserialize, Serialize, Debug, PartialEq, Clone)]
+        #[repr(C)]
+        pub struct #struct_name {
+            #(#fields),*
+        }
+        unsafe impl Portable for #struct_name {}
+    }.into()
+}
+
+fn is_input_field(ty: &syn::Type) -> bool {
+    match ty {
+        syn::Type::Ptr(token) if token.mutability.is_some() => false,
+        syn::Type::Group(TypeGroup {elem, ..}) => is_input_field(&*elem),
+        _ => true
+    }
+}
+
+fn use_wire_object(ty: &syn::PatType) -> proc_macro2::TokenStream {
+    let pat = &ty.pat;
+    let type_ = &ty.ty;
+    quote! { pub #pat : <#type_ as crate::CudaEncode>::WireObject }
+}
+
+fn strip_mut_ptr(ty: &syn::PatType) -> proc_macro2::TokenStream {
+    fn strip_mut_ptr_from_type(ty: &syn::Type) -> proc_macro2::TokenStream {
+        match ty {
+            syn::Type::Ptr(token) => {
+                let elem = &token.elem;
+                quote! { #elem }
+            },
+            _ => unreachable!()
+        }
+    }
+    let pat = &ty.pat;
+    match &*ty.ty {
+        syn::Type::Ptr(token) => {
+            let type_ = strip_mut_ptr_from_type(&*token.elem);
+            quote! { pub #pat : <#type_ as crate::CudaEncode>::WireObject }
+        },
+        syn::Type::Group(TypeGroup {elem, ..}) => {
+            let type_ = strip_mut_ptr_from_type(&*elem);
+            quote! { pub #pat : <#type_ as crate::CudaEncode>::WireObject }
+        },
+        _ => unreachable!()
+    }
+}
+
+struct FnWithFields {
+    fn_name: Ident,
+    fields: Punctuated<PatType, Token![,]>,
+}
+
+impl Parse for FnWithFields {
+    fn parse(input: ParseStream) -> syn::Result<Self> {
+        let fn_name = input.parse::<Ident>()?;
+        let fields = if input.is_empty() {
+            Punctuated::new()
+        } else {
+            input.parse::<Token![,]>()?;
+            input.parse_terminated(PatType::parse, Token![,])?
+        };
+        Ok(Self {
+            fn_name,
+            fields,
+        })
+    }
+}
+
 fn split(fn_: &str) -> Vec<String> {
+    fn needs_special_split(c: char, next: Option<char>) -> bool {
+        let Some(next_char) = next else { return false; };
+        (c.is_ascii_digit() && next_char == 'D') || (c == 'D' && next_char.is_ascii_digit())
+    }
+    // to parse segments like "2D", "D3D11" etc.
+    fn parse_special(first: char, iter: &mut iter::Peekable<impl Iterator<Item = char>>) -> String {
+        let mut segment = String::new();
+        segment.push(first.to_ascii_lowercase());
+        while let Some(c) = iter.next_if(|c| c.is_ascii_digit() || *c == 'D') {
+            segment.push(c.to_ascii_lowercase());
+        }
+        return segment;
+    }
     let mut result = Vec::new();
-    for c in fn_.chars() {
+    let mut chars: iter::Peekable<_> = fn_.chars().peekable();
+    while let Some(c) = chars.next() {
+        let next = chars.peek().copied();
+        if needs_special_split(c, next) {
+            result.push(parse_special(c, &mut chars));
+            continue;
+        }
         if c.is_ascii_uppercase() {
             result.push(c.to_ascii_lowercase().to_string());
         } else {
@@ -288,6 +445,13 @@ fn join(
             _ => return None,
         })
     }
+    fn safe_ident(segment: &str) -> Ident {
+        if segment.chars().next().unwrap().is_ascii_digit() {
+            Ident::new(&format!("_{segment}"), Span::call_site())
+        } else {
+            Ident::new(segment, Span::call_site())
+        }
+    }
     let mut normalized: Vec<&str> = Vec::new();
     for segment in fn_.iter() {
         match full_form(segment) {
@@ -297,20 +461,20 @@ fn join(
     }
     if let Some(default_module) = default_module {
         if !MODULES.contains(&normalized[0]) {
-        let mut globalized = vec![default_module];
-        globalized.extend(normalized);
-        normalized = globalized;
-    }
-    let (module, path) = normalized.split_first().unwrap();
-    let path = path.join("_");
-    [module, &&*path]
-        .into_iter()
-        .map(|s| Ident::new(s, Span::call_site()))
-        .collect()
-    } else {
-        return [Ident::new(&normalized.join("_"), Span::call_site())]
+            let mut globalized = vec![default_module];
+            globalized.extend(normalized);
+            normalized = globalized;
+        }
+        let (module, path) = normalized.split_first().unwrap();
+        let path = path.join("_");
+        [module, &&*path]
             .into_iter()
-            .collect();
+            .map(|s| safe_ident(s))
+            .collect()
+    } else {
+        [safe_ident(&normalized.join("_"))]
+            .into_iter()
+            .collect()
     }
 
 }

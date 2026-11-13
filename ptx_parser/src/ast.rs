@@ -3,8 +3,9 @@ use super::{
     StateSpace, VectorPrefix,
 };
 use crate::{
-    CacheLevel, EvictionPriority, FunnelShiftMode, MatrixLayout, MatrixNumber, MatrixShape,
-    Mul24Control, PtxError, PtxParserState, Reduction, ShiftDirection, ShuffleMode, VoteMode,
+    BmskMode, CacheLevel, EvictionPriority, FunnelShiftMode, MatrixLayout, MatrixNumber,
+    MatrixShape, Mul24Control, PtxError, PtxParserState, Reduction, ShiftDirection, ShuffleMode,
+    VoteMode, VshOp,
 };
 use bitflags::bitflags;
 use derive_more::Display;
@@ -55,24 +56,30 @@ ptx_parser_macros::generate_instruction_type!(
                 dst: T,
                 src1: T,
                 src2: T,
-            }
+            },
+            display: write!(f, "add{}", data)?
         },
-        // VEGA 3 lug: aritmetica estesa con riporto (extended-precision carry chain).
-        // Copre add.cc/addc/addc.cc/sub.cc/subc/subc.cc — usate da foreach (indirizzi 64-bit)
-        // e dal slow-path trig di exp. Il flag CC.CF e' implicito (threaded in emit), non un operando.
-        AddCarry {
+        AddExtended {
+            data: CarryDetails,
             type: { Type::Scalar(data.type_) },
-            data: AddCarryDetails,
             arguments<T>: {
                 dst: T,
                 src1: T,
                 src2: T,
             }
         },
-        // mad.lo.cc/mad.hi.cc/madc.lo.cc/madc.hi.cc/madc.hi (mul-add con riporto).
-        MadCarry {
+        SubExtended {
+            data: CarryDetails,
             type: { Type::Scalar(data.type_) },
+            arguments<T>: {
+                dst: T,
+                src1: T,
+                src2: T,
+            }
+        },
+        MadExtended {
             data: MadCarryDetails,
+            type: { Type::Scalar(data.type_) },
             arguments<T>: {
                 dst: T,
                 src1: T,
@@ -182,26 +189,21 @@ ptx_parser_macros::generate_instruction_type!(
                 },
             }
         },
-        // VEGA 3 lug: scalar video instruction vshr (solo forma u32.u32.u32.clamp.add,
-        // usata da cub radix sort → torch.sort/argsort/topk/randperm). d = (a >> clamp(b,32)) + c.
-        Vshr {
-            type: Type::Scalar(data.clone()),
-            data: ScalarType,
+        Bmsk {
+            type: Type::Scalar(ScalarType::B32),
+            data: BmskMode,
             arguments<T>: {
                 dst: T,
-                src1: T,
-                src2: {
-                    repr: T,
-                    type: Type::Scalar(ScalarType::U32)
-                },
-                src3: T,
+                src_a: T,
+                src_b: T,
             }
         },
         Bra {
             type: !,
             arguments<T::Ident>: {
                 src: T
-            }
+            },
+            display: write!(f, "bra")?
         },
         Brev {
             type: Type::Scalar(data.clone()),
@@ -323,7 +325,7 @@ ptx_parser_macros::generate_instruction_type!(
         },
         Cvta {
             data: CvtaDetails,
-            type: { Type::Scalar(ScalarType::B64) },
+            type: { if data.size == 64 { Type::Scalar(ScalarType::B64) } else { Type::Scalar(ScalarType::B32) } },
             arguments<T>: {
                 dst: T,
                 src: T,
@@ -390,7 +392,22 @@ ptx_parser_macros::generate_instruction_type!(
                     space: { data.state_space },
                 }
             },
-            display: write!(f, "<TODO:finish ld>")?
+            display: {
+                let non_coherent = if data.non_coherent {
+                    ".nc"
+                } else {
+                    ""
+                };
+                write!(
+                    f,
+                    "ld{}{}{}{}{}",
+                    data.qualifier,
+                    data.state_space,
+                    non_coherent,
+                    data.caching,
+                    data.typ,
+                )?
+            }
         },
         Lg2 {
             type: Type::Scalar(ScalarType::F32),
@@ -456,7 +473,8 @@ ptx_parser_macros::generate_instruction_type!(
                 },
                 src1: T,
                 src2: T,
-            }
+            },
+            display: write!(f, "mul{}", data)?
         },
         Mul24 {
             type: { Type::from(data.type_) },
@@ -644,8 +662,8 @@ ptx_parser_macros::generate_instruction_type!(
                 }
             }
         },
-        ShflSync {
-            data: ShflSyncDetails,
+        Shfl {
+            data: ShflDetails,
             type: Type::Scalar(ScalarType::B32),
             arguments<T>: {
                 dst: T,
@@ -656,6 +674,18 @@ ptx_parser_macros::generate_instruction_type!(
                 src: T,
                 src_lane: T,
                 src_opts: T,
+                src_membermask: Option<T>
+            }
+        },
+        MatchSync {
+            data: ScalarType,
+            type: Type::Scalar(ScalarType::B32),
+            arguments<T>: {
+                dst: T,
+                src: {
+                    repr: T,
+                    type: Type::Scalar(data.clone())
+                },
                 src_membermask: T
             }
         },
@@ -721,6 +751,16 @@ ptx_parser_macros::generate_instruction_type!(
                     repr: T,
                     relaxed_type_check: true,
                 }
+            },
+            display: {
+                write!(
+                    f,
+                    "st{}{}{}{}",
+                    data.qualifier,
+                    data.state_space,
+                    data.caching,
+                    data.typ,
+                )?
             }
         },
         Sub {
@@ -733,8 +773,6 @@ ptx_parser_macros::generate_instruction_type!(
             }
         },
         Trap { },
-        // VEGA 3 lug: PTX `exit` (termina il thread). Usata da cub radix sort (SingleTile) →
-        // torch.randperm. Terminatore di blocco, lowering = ret void.
         Exit { },
         Xor {
             type: Type::Scalar(data.clone()),
@@ -763,7 +801,7 @@ ptx_parser_macros::generate_instruction_type!(
                     type: { Type::Scalar(ScalarType::Pred) },
                 },
                 src2: {
-                    repr: T,
+                    repr: Option<T>,
                     type: { Type::Scalar(ScalarType::U32) },
                 }
             }
@@ -839,7 +877,152 @@ ptx_parser_macros::generate_instruction_type!(
                     relaxed_type_check: true
                 }
             }
-        }
+        },
+        Sad {
+            type: Type::Scalar(data.clone()),
+            data: ScalarType,
+            arguments<T>: {
+                dst: T,
+                src1: T,
+                src2: T,
+                src3: T,
+            }
+        },
+        Dp2a {
+            type: !,
+            data: Dp2aData,
+            arguments<T>: {
+                dst: {
+                    repr: T,
+                    type: { Type::Scalar(data.ctype()) },
+
+                },
+                src1:  {
+                    repr: T,
+                    type: { Type::Scalar(data.atype) },
+
+                },
+                src2:  {
+                    repr: T,
+                    type: { Type::Scalar(data.btype) },
+
+                },
+                src3:  {
+                    repr: T,
+                    type: { Type::Scalar(data.ctype()) },
+
+                }
+            }
+        },
+        Vshr {
+            type: Type::Scalar(ScalarType::U32),
+            data: VshData,
+            arguments<T>: {
+                dst: T,
+                src1: T,
+                src2: T,
+                src3: T
+            }
+        },
+        Tex {
+            type: !,
+            data: TexData,
+            arguments<T>: {
+                dst: {
+                    repr: T,
+                    type: { Type::Vector(4, data.dtype) },
+
+                },
+                src_ptr:  {
+                    repr: T,
+                    type: {
+                        if data.type_ == TexType::Ref {
+                            Type::Texref
+                        } else {
+                            Type::Scalar(ScalarType::U64)
+                        }
+                    },
+                    space: {
+                        if data.type_ == TexType::Ref {
+                            StateSpace::Global
+                        } else {
+                            StateSpace::Reg
+                        }
+                    },
+
+                },
+                src_coord:  {
+                    repr: T,
+                    type: { data.coord_type() },
+
+                },
+            }
+        },
+        Suld {
+            type: !,
+            data: SuldData,
+            arguments<T>: {
+                dst: {
+                    repr: T,
+                    type: { &data.dst_type },
+                    relaxed_type_check: true,
+                },
+                src_ptr: {
+                    repr: T,
+                    type: {
+                        if data.type_ == TexType::Ref {
+                            Type::Surfref
+                        } else {
+                            Type::Scalar(ScalarType::U64)
+                        }
+                    },
+                    space: {
+                        if data.type_ == TexType::Ref {
+                            StateSpace::Global
+                        } else {
+                            StateSpace::Reg
+                        }
+                    },
+                },
+                src_coord:  {
+                    repr: T,
+                    type: { data.coord_type() },
+                },
+            }
+        },
+        Sust {
+            type: !,
+            data: SuldData,
+            arguments<T>: {
+                src_ptr: {
+                    repr: T,
+                    type: {
+                        if data.type_ == TexType::Ref {
+                            Type::Surfref
+                        } else {
+                            Type::Scalar(ScalarType::U64)
+                        }
+                    },
+                    space: {
+                        if data.type_ == TexType::Ref {
+                            StateSpace::Global
+                        } else {
+                            StateSpace::Reg
+                        }
+                    },
+                },
+                src_coord:  {
+                    repr: T,
+                    type: { data.coord_type() },
+
+                },
+                src_data:  {
+                    repr: T,
+                    type: { &data.dst_type },
+                    relaxed_type_check: true,
+                },
+            }
+        },
     }
 );
 
@@ -950,21 +1133,21 @@ where
                 (self)(ident, type_space, is_dst, relaxed_type_check)?,
                 index,
             ),
-            ParsedOperand::VecPack(vec) => ParsedOperand::VecPack(
-                vec.into_iter()
-                    .map(|reg_or_immediate| {
-                        Ok(match reg_or_immediate {
-                            RegOrImmediate::Reg(ident) => RegOrImmediate::Reg((self)(
-                                ident,
-                                type_space,
-                                is_dst,
-                                relaxed_type_check,
-                            )?),
-                            RegOrImmediate::Imm(imm) => RegOrImmediate::Imm(imm),
+            ParsedOperand::VecPack(vec) => {
+                ParsedOperand::VecPack(
+                    vec.into_iter()
+                        .map(|element| {
+                            Ok(match element {
+                                Some(RegOrImmediate::Reg(ident)) => Some(RegOrImmediate::Reg(
+                                    (self)(ident, type_space, is_dst, relaxed_type_check)?,
+                                )),
+                                Some(RegOrImmediate::Imm(imm)) => Some(RegOrImmediate::Imm(imm)),
+                                None => None,
+                            })
                         })
-                    })
-                    .collect::<Result<Vec<_>, _>>()?,
-            ),
+                        .collect::<Result<Vec<_>, _>>()?,
+                )
+            }
         })
     }
 
@@ -1132,6 +1315,12 @@ impl<ID: std::fmt::Display> std::fmt::Display for Variable<ID> {
             Type::Array(vector_size, scalar_type, array_dims) => {
                 (vector_size.map(|s| s.get()), *scalar_type, array_dims)
             }
+            Type::Texref => {
+                return write!(f, " .texref");
+            }
+            Type::Surfref => {
+                return write!(f, " .surfref");
+            }
         };
 
         if let Some(size) = vector_size {
@@ -1165,6 +1354,8 @@ pub enum Type {
     Vector(u8, ScalarType),
     // .param.b32 foo[4];
     Array(Option<NonZeroU8>, ScalarType, Vec<u32>),
+    Texref,
+    Surfref,
 }
 
 impl std::fmt::Display for Type {
@@ -1203,8 +1394,8 @@ impl Type {
         }
     }
 
-    pub fn layout(&self) -> Layout {
-        match self {
+    pub fn layout(&self) -> Option<Layout> {
+        Some(match self {
             Type::Scalar(type_) => type_.layout(),
             Type::Vector(elements, scalar_type) => {
                 let scalar_layout = scalar_type.layout();
@@ -1216,7 +1407,7 @@ impl Type {
                 }
             }
             Type::Array(non_zero, scalar, vec) => {
-                let element_layout = Type::maybe_vector_parsed(*non_zero, *scalar).layout();
+                let element_layout = Type::maybe_vector_parsed(*non_zero, *scalar).layout()?;
                 let len = vec.iter().copied().reduce(std::ops::Mul::mul).unwrap_or(0);
                 unsafe {
                     Layout::from_size_align_unchecked(
@@ -1225,7 +1416,9 @@ impl Type {
                     )
                 }
             }
-        }
+            Type::Texref => return None,
+            Type::Surfref => return None,
+        })
     }
 }
 
@@ -1235,6 +1428,7 @@ impl ScalarType {
             1 => ScalarType::B8,
             2 => ScalarType::B16,
             4 => ScalarType::B32,
+            8 => ScalarType::B64,
             16 => ScalarType::B128,
             _ => return None,
         })
@@ -1264,6 +1458,9 @@ impl ScalarType {
     }
 
     pub fn bit_size(self) -> u8 {
+        if matches!(self, ScalarType::Pred) {
+            return 1;
+        }
         self.layout().size() as u8 * 8u8
     }
 
@@ -1381,7 +1578,7 @@ impl MovDetails {
 }
 
 #[derive(Copy, Clone)]
-pub struct ShflSyncDetails {
+pub struct ShflDetails {
     pub mode: ShuffleMode,
 }
 
@@ -1421,8 +1618,8 @@ pub struct ShfDetails {
     pub direction: ShiftDirection,
     pub mode: FunnelShiftMode,
 }
-
-#[derive(Clone, Copy, Display)]
+#[cfg_attr(debug_assertions, derive(PartialEq))]
+#[derive(Clone, Copy, Display, Debug)]
 pub enum RegOrImmediate<Ident> {
     Reg(Ident),
     Imm(ImmediateValue),
@@ -1431,10 +1628,11 @@ pub enum RegOrImmediate<Ident> {
 #[derive(Clone)]
 pub enum ParsedOperand<Ident> {
     Reg(Ident),
-    RegOffset(Ident, i32),
+    RegOffset(Ident, i64),
     Imm(ImmediateValue),
     VecMember(Ident, u8),
-    VecPack(Vec<RegOrImmediate<Ident>>),
+    // None denotes a sink; retain its position in the vector.
+    VecPack(Vec<Option<RegOrImmediate<Ident>>>),
 }
 
 impl<Ident> ParsedOperand<Ident> {
@@ -1471,7 +1669,10 @@ where
                     if idx != 0 {
                         write!(f, ", ")?;
                     }
-                    write!(f, "{}", item)?;
+                    match item {
+                        Some(item) => write!(f, "{}", item)?,
+                        None => f.write_char('_')?,
+                    }
                 }
                 f.write_char('}')?
             }
@@ -1494,7 +1695,8 @@ pub trait Operand: Sized {
     fn from_ident(ident: Self::Ident) -> Self;
 }
 
-#[derive(Copy, Clone)]
+#[cfg_attr(debug_assertions, derive(PartialEq))]
+#[derive(Copy, Clone, Debug)]
 pub enum ImmediateValue {
     U64(u64),
     S64(i64),
@@ -1511,10 +1713,20 @@ impl ImmediateValue {
             ImmediateValue::F32(_) | ImmediateValue::F64(_) => None,
         }
     }
+
     pub fn as_f64(&self) -> Option<f64> {
         match *self {
             ImmediateValue::F64(n) => Some(n),
             _ => None,
+        }
+    }
+
+    pub fn get_bits(&self) -> u64 {
+        match self {
+            ImmediateValue::U64(n) => *n,
+            ImmediateValue::S64(n) => *n as u64,
+            ImmediateValue::F32(n) => n.to_bits() as u64,
+            ImmediateValue::F64(n) => n.to_bits(),
         }
     }
 }
@@ -1522,10 +1734,10 @@ impl ImmediateValue {
 impl std::fmt::Display for ImmediateValue {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            ImmediateValue::U64(n) => write!(f, "{}", n)?,
+            ImmediateValue::U64(n) => write!(f, "{}U", n)?,
             ImmediateValue::S64(n) => write!(f, "{}", n)?,
-            ImmediateValue::F32(n) => write!(f, "{}", n)?,
-            ImmediateValue::F64(n) => write!(f, "{}", n)?,
+            ImmediateValue::F32(n) => write!(f, "0f{:x}", n.to_bits())?,
+            ImmediateValue::F64(n) => write!(f, "0d{:x}", n.to_bits())?,
         }
         Ok(())
     }
@@ -1539,6 +1751,18 @@ pub enum StCacheOperator {
     Writethrough,
 }
 
+impl Display for StCacheOperator {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            StCacheOperator::Writeback => {}
+            StCacheOperator::L2Only => write!(f, ".cg")?,
+            StCacheOperator::Streaming => write!(f, ".cs")?,
+            StCacheOperator::Writethrough => write!(f, ".wt")?,
+        }
+        Ok(())
+    }
+}
+
 #[derive(Copy, Clone, PartialEq, Eq)]
 pub enum LdCacheOperator {
     Cached,
@@ -1548,9 +1772,39 @@ pub enum LdCacheOperator {
     Uncached,
 }
 
+impl Display for LdCacheOperator {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            LdCacheOperator::Cached => {}
+            LdCacheOperator::L2Only => write!(f, ".cg")?,
+            LdCacheOperator::Streaming => write!(f, ".cs")?,
+            LdCacheOperator::LastUse => write!(f, ".lu")?,
+            LdCacheOperator::Uncached => write!(f, ".cv")?,
+        }
+        Ok(())
+    }
+}
+
 pub enum CpAsyncCacheOperator {
     Cached,
     L2Only,
+}
+
+pub enum CarryKind {
+    CarryIn,
+    CarryOut,
+    CarryInCarryOut,
+}
+
+pub struct CarryDetails {
+    pub kind: CarryKind,
+    pub type_: ScalarType,
+}
+
+pub struct MadCarryDetails {
+    pub kind: CarryKind,
+    pub control: MulIntControl,
+    pub type_: ScalarType,
 }
 
 #[derive(Copy, Clone)]
@@ -1568,10 +1822,34 @@ impl ArithDetails {
     }
 }
 
+impl std::fmt::Display for ArithDetails {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ArithDetails::Integer(int) => {
+                write!(f, "{}", int)?;
+            }
+            ArithDetails::Float(float) => {
+                write!(f, "{}", float)?;
+            }
+        }
+        Ok(())
+    }
+}
+
 #[derive(Copy, Clone)]
 pub struct ArithInteger {
     pub type_: ScalarType,
     pub saturate: bool,
+}
+
+impl std::fmt::Display for ArithInteger {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.saturate {
+            write!(f, ".sat")?;
+        }
+        write!(f, "{}", self.type_)?;
+        Ok(())
+    }
 }
 
 #[derive(Copy, Clone)]
@@ -1589,6 +1867,20 @@ pub struct ArithFloat {
     pub is_fusable: bool,
 }
 
+impl std::fmt::Display for ArithFloat {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.rounding)?;
+        if let Some(true) = self.flush_to_zero {
+            write!(f, ".ftz")?;
+        }
+        if self.saturate {
+            write!(f, ".sat")?;
+        }
+        write!(f, "{}", self.type_)?;
+        Ok(())
+    }
+}
+
 #[derive(Copy, Clone, PartialEq, Eq)]
 pub enum LdStQualifier {
     Weak,
@@ -1598,12 +1890,37 @@ pub enum LdStQualifier {
     Release(MemScope),
 }
 
+impl Display for LdStQualifier {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            LdStQualifier::Weak => {}
+            LdStQualifier::Volatile => write!(f, ".volatile")?,
+            LdStQualifier::Relaxed(scope) => write!(f, ".relaxed{scope}")?,
+            LdStQualifier::Acquire(scope) => write!(f, ".acquire{scope}")?,
+            LdStQualifier::Release(scope) => write!(f, ".release{scope}")?,
+        }
+        Ok(())
+    }
+}
+
 #[derive(PartialEq, Eq, Copy, Clone, Debug)]
 pub enum RoundingMode {
     NearestEven,
     Zero,
     NegativeInf,
     PositiveInf,
+}
+
+impl std::fmt::Display for RoundingMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            RoundingMode::NearestEven => write!(f, ".rn")?,
+            RoundingMode::Zero => write!(f, ".rz")?,
+            RoundingMode::NegativeInf => write!(f, ".rm")?,
+            RoundingMode::PositiveInf => write!(f, ".rp")?,
+        }
+        Ok(())
+    }
 }
 
 pub struct LdDetails {
@@ -1755,16 +2072,20 @@ pub enum Directive<'input, O: Operand> {
 
 pub struct Module<'input> {
     pub ptx_version: (u8, u8),
+    pub sm_version: u32,
     pub directives: Vec<Directive<'input, ParsedOperand<&'input str>>>,
     pub invalid_directives: usize,
+    pub address_size: u8,
 }
 
 impl Module<'_> {
     pub fn empty() -> Self {
         Module {
             ptx_version: (1, 0),
+            sm_version: 0,
             directives: Vec::new(),
             invalid_directives: usize::MAX,
+            address_size: 64,
         }
     }
 }
@@ -1803,6 +2124,19 @@ impl MulDetails {
     }
 }
 
+impl std::fmt::Display for MulDetails {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            MulDetails::Integer { type_, control } => {
+                write!(f, "{}{}", type_, control)
+            }
+            MulDetails::Float(arith) => {
+                write!(f, "{}", arith)
+            }
+        }
+    }
+}
+
 #[derive(Copy, Clone, PartialEq, Eq)]
 pub enum MulIntControl {
     Low,
@@ -1810,21 +2144,14 @@ pub enum MulIntControl {
     Wide,
 }
 
-// VEGA 3 lug: dettagli aritmetica con riporto (extended-precision carry).
-#[derive(Copy, Clone)]
-pub struct AddCarryDetails {
-    pub type_: ScalarType,
-    pub subtract: bool,  // false=add.cc/addc, true=sub.cc/subc
-    pub carry_in: bool,  // legge CC.CF (prefisso 'c': addc/subc)
-    pub carry_out: bool, // scrive CC.CF (suffisso '.cc')
-}
-
-#[derive(Copy, Clone)]
-pub struct MadCarryDetails {
-    pub type_: ScalarType,
-    pub hi: bool,        // false=.lo, true=.hi
-    pub carry_in: bool,  // 'madc'
-    pub carry_out: bool, // '.cc'
+impl std::fmt::Display for MulIntControl {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            MulIntControl::Low => write!(f, ".lo"),
+            MulIntControl::High => write!(f, ".hi"),
+            MulIntControl::Wide => write!(f, ".wide"),
+        }
+    }
 }
 
 #[derive(Copy, Clone)]
@@ -2343,6 +2670,7 @@ pub enum RightShiftKind {
 pub struct CvtaDetails {
     pub state_space: StateSpace,
     pub direction: CvtaDirection,
+    pub size: u8,
 }
 
 pub enum CvtaDirection {
@@ -2605,4 +2933,80 @@ impl MmaDetails {
 pub struct PrefetchData {
     pub space: StateSpace,
     pub level: CacheLevel,
+}
+
+#[derive(Clone, Copy)]
+pub struct Dp2aData {
+    pub atype: ScalarType,
+    pub btype: ScalarType,
+    pub control: Dp2aControl,
+}
+
+impl Dp2aData {
+    pub fn ctype(&self) -> ScalarType {
+        match (self.atype, self.btype) {
+            (ScalarType::U32, ScalarType::U32) => ScalarType::U32,
+            _ => ScalarType::S32,
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+pub enum Dp2aControl {
+    Low,
+    High,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
+pub enum TexDimensions {
+    D1,
+    D2,
+    D3,
+}
+
+pub struct TexData {
+    pub type_: TexType,
+    pub dtype: ScalarType,
+    pub ctype: ScalarType,
+    pub dims: TexDimensions,
+}
+
+impl TexData {
+    pub fn coord_type(&self) -> Type {
+        let dims = match self.dims {
+            TexDimensions::D1 => 1,
+            TexDimensions::D2 => 2,
+            TexDimensions::D3 => 4,
+        };
+        Type::Vector(dims, self.ctype)
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
+pub enum TexType {
+    Ref,
+    Obj,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+pub struct VshData {
+    pub mode: FunnelShiftMode,
+    pub op2: VshOp,
+}
+
+pub struct SuldData {
+    pub type_: TexType,
+    pub dst_type: Type,
+    pub dims: TexDimensions,
+}
+
+impl SuldData {
+    pub fn coord_type(&self) -> Type {
+        let dims = match self.dims {
+            TexDimensions::D1 => 1,
+            TexDimensions::D2 => 2,
+            TexDimensions::D3 => 4,
+        };
+        Type::Vector(dims, ScalarType::S32)
+    }
 }

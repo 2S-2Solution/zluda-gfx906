@@ -1,12 +1,52 @@
-use cuda_types::cuda::CUfunction_attribute;
+use crate::r#impl::driver;
+use cuda_types::cuda::{CUerror, CUfunction, CUfunction_attribute, CUkernel};
+use dark_api::FunctionArgInfo;
 use hip_runtime_sys::*;
 use std::mem;
+
+pub(crate) struct Function {
+    pub(crate) base: hipFunction_t,
+    pub(crate) sm_version: u32,
+    pub(crate) explicit_args_size_align: Option<Vec<FunctionArgInfo>>,
+}
+
+impl<'a, E: zluda_common::CudaErrorType> zluda_common::FromCuda<'a, CUfunction, E>
+    for &'a Function
+{
+    fn from_cuda(cu_func: &'a CUfunction) -> Result<Self, E> {
+        Ok(unsafe { mem::transmute(*cu_func) })
+    }
+}
+
+impl<'a, E: zluda_common::CudaErrorType> zluda_common::FromCuda<'a, CUkernel, E> for &'a Function {
+    fn from_cuda(cu_func: &'a CUkernel) -> Result<Self, E> {
+        Ok(unsafe { mem::transmute(*cu_func) })
+    }
+}
+
+impl<'a, E: zluda_common::CudaErrorType> zluda_common::FromCuda<'a, *mut CUfunction, E>
+    for &'a mut &'a Function
+{
+    fn from_cuda(cu_func: &'a *mut CUfunction) -> Result<Self, E> {
+        let cu_func = unsafe { cu_func.as_mut() }.ok_or_else(|| E::INVALID_VALUE)?;
+        Ok(unsafe { mem::transmute(cu_func) })
+    }
+}
+
+impl<'a, E: zluda_common::CudaErrorType> zluda_common::FromCuda<'a, *mut CUkernel, E>
+    for &'a mut &'a Function
+{
+    fn from_cuda(cu_func: &'a *mut CUkernel) -> Result<Self, E> {
+        let cu_func = unsafe { cu_func.as_mut() }.ok_or_else(|| E::INVALID_VALUE)?;
+        Ok(unsafe { mem::transmute(cu_func) })
+    }
+}
 
 pub(crate) fn get_attribute(
     pi: &mut i32,
     cu_attrib: CUfunction_attribute,
-    func: hipFunction_t,
-) -> hipError_t {
+    func: &Function,
+) -> Result<(), CUerror> {
     match cu_attrib {
         // Architettura virtuale del codice caricato. Va riportata quella VERA, letta
         // dal `.target` del PTX: le librerie a template la usano per scegliere i
@@ -21,13 +61,28 @@ pub(crate) fn get_attribute(
         // dati restava non scritta da nessuno: misurato il 31 lug 2026, `cumsum` su
         // 4096 int64 lasciava intatti gli ultimi 256 elementi. Stessa causa per
         // unique, randperm, nonzero, topk, scatter_add, masked_select.
-        CUfunction_attribute::CU_FUNC_ATTRIBUTE_PTX_VERSION
-        | CUfunction_attribute::CU_FUNC_ATTRIBUTE_BINARY_VERSION => {
-            let arch = super::module::ARCH_PTX_CARICATO.load(std::sync::atomic::Ordering::Relaxed);
-            // Se non e' ancora stato caricato alcun PTX si resta prudenti: 3.5 e' la
-            // soglia piu' bassa delle policy di cub, quindi non promette nulla che il
-            // codice caricato poi non sappia fare.
-            *pi = if arch > 0 { arch } else { 35 };
+        //
+        // Da upstream (merge del 13 nov 2026) il valore arriva per funzione dal modulo
+        // (`sm_version`, cioe' il `.target` del suo PTX). Per i moduli che non hanno
+        // metadati ZLUDA (hsaco di hipRTC, modulo supplementare) resta il ripiego di
+        // prima: l'architettura piu' bassa fra i PTX caricati, o 3.5 se non ce n'e'.
+        CUfunction_attribute::CU_FUNC_ATTRIBUTE_PTX_VERSION => {
+            *pi = if func.sm_version > 0 {
+                func.sm_version as i32
+            } else {
+                let arch =
+                    super::module::ARCH_PTX_CARICATO.load(std::sync::atomic::Ordering::Relaxed);
+                if arch > 0 {
+                    arch
+                } else {
+                    35
+                }
+            };
+            return Ok(());
+        }
+        CUfunction_attribute::CU_FUNC_ATTRIBUTE_BINARY_VERSION => {
+            let (major_cap, minor_cap) = driver::global_state()?.compute_capability;
+            *pi = major_cap * 10 + minor_cap;
             return Ok(());
         }
         CUfunction_attribute::CU_FUNC_ATTRIBUTE_CLUSTER_SIZE_MUST_BE_SET
@@ -41,26 +96,20 @@ pub(crate) fn get_attribute(
         }
         _ => {}
     }
-    unsafe { hipFuncGetAttribute(pi, mem::transmute(cu_attrib), func) }?;
+    unsafe { hipFuncGetAttribute(pi, mem::transmute(cu_attrib), func.base) }?;
     if cu_attrib == CUfunction_attribute::CU_FUNC_ATTRIBUTE_NUM_REGS {
         *pi = (*pi).max(1);
     }
     Ok(())
 }
 
-// VEGA-PATCH 2026-06-28 sprint-orch v2 nvcuda-6: costanti CUDA per extra array launch_kernel.
-// CUDA usa array `extra` come terminated-list di coppie (tag, value) con questi tag noti:
-//   CU_LAUNCH_PARAM_END             = 0x00  (terminatore, value ignorato)
-//   CU_LAUNCH_PARAM_BUFFER_POINTER  = 0x01  (value = ptr a buffer parametri impacchettati)
-//   CU_LAUNCH_PARAM_BUFFER_SIZE     = 0x02  (value = ptr a size_t con dimensione buffer)
-// HIP supporta lo stesso protocollo con valori bit-compatibili, quindi il passthrough è
-// generalmente safe; tuttavia validiamo qui i tag per evitare di girare ad HIP array malformati.
-const CU_LAUNCH_PARAM_END_TAG: usize = 0x00;
-const CU_LAUNCH_PARAM_BUFFER_POINTER_TAG: usize = 0x01;
-const CU_LAUNCH_PARAM_BUFFER_SIZE_TAG: usize = 0x02;
+const CU_LAUNCH_PARAM_BUFFER_POINTER: usize = 0x01;
+const CU_LAUNCH_PARAM_BUFFER_SIZE: usize = 0x02;
+const CU_LAUNCH_PARAM_END: usize = 0x00;
+const HIP_LAUNCH_PARAM_END: usize = 0x03;
 
-pub(crate) fn launch_kernel(
-    f: hipFunction_t,
+pub(crate) unsafe fn launch_kernel(
+    f: &Function,
     grid_dim_x: ::core::ffi::c_uint,
     grid_dim_y: ::core::ffi::c_uint,
     grid_dim_z: ::core::ffi::c_uint,
@@ -83,40 +132,36 @@ pub(crate) fn launch_kernel(
             block_dim_x, block_dim_y, block_dim_z, shared_mem_bytes
         );
     }
-    // VEGA-PATCH 2026-06-28 sprint-orch v2 nvcuda-6: validazione array extra prima di
-    // delegare ad HIP. Se extra è non-null, scorriamo la lista di tag terminata da
-    // CU_LAUNCH_PARAM_END accettando solo i tag noti. Se troviamo un tag sconosciuto
-    // ritorniamo InvalidValue piuttosto che propagare puntatori potenzialmente unsafe.
-    // kernel_params ed extra sono mutuamente esclusivi per spec CUDA: se entrambi
-    // non-null lasciamo che HIP gestisca l'errore standard.
-    if !extra.is_null() && kernel_params.is_null() {
-        unsafe {
-            let mut idx = 0isize;
-            loop {
-                let tag_ptr = *extra.offset(idx);
-                let tag = tag_ptr as usize;
-                match tag {
-                    CU_LAUNCH_PARAM_END_TAG => break,
-                    CU_LAUNCH_PARAM_BUFFER_POINTER_TAG
-                    | CU_LAUNCH_PARAM_BUFFER_SIZE_TAG => {
-                        // tag valido: salta tag + value
-                        idx += 2;
-                    }
-                    _ => {
-                        // tag sconosciuto: rifiuta senza dereferenziare oltre
-                        return Err(hipErrorCode_t::InvalidValue);
-                    }
-                }
-                // safety net: evita loop infiniti se array non terminato (max 64 coppie)
-                if idx > 128 {
-                    return Err(hipErrorCode_t::InvalidValue);
-                }
+    if let Some(extra) = extra.cast::<[usize; 5]>().as_ref() {
+        match extra {
+            [CU_LAUNCH_PARAM_BUFFER_POINTER, pointer, CU_LAUNCH_PARAM_BUFFER_SIZE, size, CU_LAUNCH_PARAM_END] =>
+            {
+                let mut hip_extra: [_; 5] = [
+                    CU_LAUNCH_PARAM_BUFFER_POINTER,
+                    *pointer,
+                    CU_LAUNCH_PARAM_BUFFER_SIZE,
+                    *size,
+                    HIP_LAUNCH_PARAM_END,
+                ];
+                hipModuleLaunchKernel(
+                    f.base,
+                    grid_dim_x,
+                    grid_dim_y,
+                    grid_dim_z,
+                    block_dim_x,
+                    block_dim_y,
+                    block_dim_z,
+                    shared_mem_bytes,
+                    stream,
+                    kernel_params,
+                    hip_extra.as_mut_ptr().cast(),
+                )
             }
+            _ => hipError_t::ErrorInvalidValue,
         }
-    }
-    unsafe {
+    } else {
         hipModuleLaunchKernel(
-            f,
+            f.base,
             grid_dim_x,
             grid_dim_y,
             grid_dim_z,
@@ -132,7 +177,7 @@ pub(crate) fn launch_kernel(
 }
 
 pub(crate) unsafe fn set_attribute(
-    func: hipFunction_t,
+    func: &Function,
     attribute: CUfunction_attribute,
     value: i32,
 ) -> hipError_t {
@@ -143,5 +188,64 @@ pub(crate) unsafe fn set_attribute(
         }
         _ => {}
     }
-    hipFuncSetAttribute(func.0.cast(), hipFuncAttribute(attribute.0), value)
+    hipFuncSetAttribute(func.base.0.cast(), hipFuncAttribute(attribute.0), value)
+}
+
+pub(crate) unsafe fn set_cache_config(
+    _func: &Function,
+    _config: cuda_types::cuda::CUfunc_cache,
+) -> hipError_t {
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::tests::CudaApi;
+    use cuda_macros::test_cuda;
+    use cuda_types::cuda::{CUdevice_attribute, CUfunction_attribute};
+    use std::mem;
+
+    #[test_cuda]
+    fn check_versions(api: impl CudaApi) {
+        api.cuInit(0);
+        let mut ctx = unsafe { mem::zeroed() };
+        api.cuCtxCreate_v2(&mut ctx, 0, 0);
+        let mut major = 0;
+        api.cuDeviceGetAttribute(
+            &mut major,
+            CUdevice_attribute::CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR,
+            0,
+        );
+        let mut minor = 0;
+        api.cuDeviceGetAttribute(
+            &mut minor,
+            CUdevice_attribute::CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR,
+            0,
+        );
+        let ptx = c".version 8.7
+        .target sm_60
+        .address_size 64
+
+        .entry foobar() { ret; }
+        ";
+
+        let mut module = unsafe { mem::zeroed() };
+        api.cuModuleLoadData(&mut module, ptx.as_ptr().cast());
+        let mut func = unsafe { mem::zeroed() };
+        api.cuModuleGetFunction(&mut func, module, c"foobar".as_ptr().cast());
+        let mut binary_version = 0;
+        api.cuFuncGetAttribute(
+            &mut binary_version,
+            CUfunction_attribute::CU_FUNC_ATTRIBUTE_BINARY_VERSION,
+            func,
+        );
+        let mut ptx_version = 0;
+        api.cuFuncGetAttribute(
+            &mut ptx_version,
+            CUfunction_attribute::CU_FUNC_ATTRIBUTE_PTX_VERSION,
+            func,
+        );
+        assert_eq!(binary_version, major * 10 + minor);
+        assert_eq!(ptx_version, 60);
+    }
 }

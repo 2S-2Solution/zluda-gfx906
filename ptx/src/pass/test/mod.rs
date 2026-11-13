@@ -1,6 +1,7 @@
 use ptx_parser as ast;
 use std::{
     env, error,
+    ffi::OsStr,
     fs::{self, File},
     io::Write,
     path::Path,
@@ -8,6 +9,7 @@ use std::{
 
 mod expand_operands;
 mod insert_implicit_conversions;
+mod instruction_mode_to_global_mode;
 mod normalize_basic_blocks;
 
 #[macro_export]
@@ -22,7 +24,11 @@ macro_rules! test_pass {
                 let ptx_in = parts.next().unwrap_or("").trim();
                 let ptx_out = parts.next().unwrap_or("").trim();
                 assert!(parts.next().is_none());
-                crate::pass::test::test_pass_assert(stringify!($test_name), $pass, ptx_in, ptx_out)
+                let out_dir_suffix = std::path::Path::new(file!())
+                    .parent()
+                    .and_then(|p| p.file_name())
+                    .unwrap();
+                crate::pass::test::test_pass_assert(stringify!($test_name), out_dir_suffix, $pass, ptx_in, ptx_out)
             }
         }
     };
@@ -31,7 +37,7 @@ pub(crate) use test_pass;
 
 use crate::pass::IdentEntry;
 
-use super::{Directive2, Function2, GlobalStringIdentResolver2, SpirvWord, Statement};
+use super::{Directive2, Function, GlobalStringIdentResolver2, SpirvWord, Statement};
 
 fn directive2_vec_to_string(
     resolver: &GlobalStringIdentResolver2,
@@ -63,15 +69,9 @@ fn directive_to_string(
 
 fn function_to_string(
     resolver: &GlobalStringIdentResolver2,
-    function: Function2<ast::Instruction<SpirvWord>, SpirvWord>,
+    function: Function<ast::Instruction<SpirvWord>, SpirvWord>,
 ) -> String {
-    if function.import_as.is_some()
-        || function.tuning.len() > 0
-        || function.flush_to_zero_f32
-        || function.flush_to_zero_f16f64
-        || function.rounding_mode_f32 != ast::RoundingMode::NearestEven
-        || function.rounding_mode_f16f64 != ast::RoundingMode::NearestEven
-    {
+    if function.import_as.is_some() || function.tuning.len() > 0 {
         todo!("Figure out some way of representing these in text");
     }
 
@@ -81,7 +81,7 @@ fn function_to_string(
         "".to_string()
     };
 
-    let entry = if !function.is_kernel {
+    let entry = if !function.is_kernel() {
         format!(".func ")
     } else {
         format!(".entry ")
@@ -100,6 +100,34 @@ fn function_to_string(
         "".to_string()
     };
 
+    let mut pragmas = vec![];
+    if let Some(kernel_attrs) = &function.kernel_attributes {
+        if kernel_attrs.flush_to_zero_f32 {
+            pragmas.push("set_mode.denormal.f32 on".to_string());
+        }
+        if kernel_attrs.flush_to_zero_f16f64 {
+            pragmas.push("set_mode.denormal.f16f64 on".to_string());
+        }
+        if kernel_attrs.rounding_mode_f32 != ast::RoundingMode::NearestEven {
+            pragmas.push(format!(
+                "set_mode.rounding.f32 {}",
+                kernel_attrs.rounding_mode_f32
+            ));
+        }
+        if kernel_attrs.rounding_mode_f16f64 != ast::RoundingMode::NearestEven {
+            pragmas.push(format!(
+                "set_mode.rounding.f16f64 {}",
+                kernel_attrs.rounding_mode_f16f64
+            ));
+        }
+    }
+
+    let pragma = if !pragmas.is_empty() {
+        format!(" .pragma \"zluda {}\" ", pragmas.join(", "))
+    } else {
+        "".to_string()
+    };
+
     let input_arguments = function
         .input_arguments
         .iter()
@@ -110,7 +138,15 @@ fn function_to_string(
     let body = if let Some(stmts) = function.body {
         let stmt_strings = stmts
             .into_iter()
-            .map(|stmt| format!("    {}\n", statement_to_string(resolver, stmt)))
+            .map(|stmt| {
+                let is_label = matches!(stmt, Statement::Label(_));
+                let stmt_string = statement_to_string(resolver, stmt);
+                if is_label {
+                    format!("{}\n", stmt_string)
+                } else {
+                    format!("    {}\n", stmt_string)
+                }
+            })
             .collect::<Vec<_>>()
             .join("");
         format!("\n{{\n{}}}", stmt_strings)
@@ -119,8 +155,8 @@ fn function_to_string(
     };
 
     format!(
-        "{}{}{}{} ({}\n){}",
-        linkage, entry, return_arguments, function.name, input_arguments, body
+        "{}{}{}{}{} ({}\n){}",
+        linkage, entry, return_arguments, function.name, pragma, input_arguments, body
     )
 }
 
@@ -162,14 +198,23 @@ impl<'a> ast::VisitorMap<SpirvWord, SpirvWord, ()> for StatementFormatter<'a> {
     fn visit(
         &mut self,
         arg: SpirvWord,
-        type_space: Option<(&ptx_parser::Type, ptx_parser::StateSpace)>,
+        _type_space: Option<(&ptx_parser::Type, ptx_parser::StateSpace)>,
         is_dst: bool,
         _relaxed_type_check: bool,
     ) -> Result<SpirvWord, ()> {
         if is_dst {
-            if let Some(IdentEntry { name: None, .. }) = self.resolver.ident_map.get(&arg) {
+            if let Some(IdentEntry {
+                name: None,
+                type_space,
+            }) = self.resolver.ident_map.get(&arg)
+            {
                 let type_string = if let Some((type_, state_space)) = type_space {
-                    format!("{}{} ", type_, state_space)
+                    // We use the type_space from the resolver rather than from the operand, to avoid hiding implicit conversions
+                    let state_space = match state_space {
+                        ast::StateSpace::Generic => ".generic".to_string(),
+                        _ => format!("{}", state_space),
+                    };
+                    format!("{}{} ", state_space, type_)
                 } else {
                     "".to_string()
                 };
@@ -201,12 +246,14 @@ fn statement_to_string(
     stmt: Statement<ast::Instruction<SpirvWord>, SpirvWord>,
 ) -> String {
     let (op, visit_args) = match &stmt {
-        Statement::Variable(var) => (format!("{}", var), true),
+        Statement::Variable(var) => (format!("{};", var), false),
         Statement::Instruction(instr) => (format!("{}", instr), true),
         Statement::Conversion(conv) => (format!("{}", conv), true),
         Statement::Constant(constant) => (format!("{}", constant), true),
         Statement::RepackVector(repack) => (format!("{}", repack), true),
         Statement::Label(label) => (format!("{}:", label), false),
+        Statement::SetMode(mode) => (format!("{}", mode), true),
+        Statement::Conditional(cond) => (format!("{}", cond), true),
         _ => todo!(),
     };
     if visit_args {
@@ -220,6 +267,7 @@ fn statement_to_string(
 
 fn test_pass_assert<F, D>(
     name: &str,
+    pass_name: &OsStr,
     run_pass: F,
     ptx_in: &str,
     expected_ptx_out: &str,
@@ -237,31 +285,46 @@ where
     for err in errs {
         eprintln!("{}", err);
     }
-    compare_ptx(name, ptx_in, actual_ptx_out.trim(), expected_ptx_out);
+    compare_ptx(
+        name,
+        pass_name,
+        ptx_in,
+        actual_ptx_out.trim(),
+        expected_ptx_out,
+    );
     Ok(())
 }
 
-fn compare_ptx(name: &str, ptx_in: &str, actual_ptx_out: &str, expected_ptx_out: &str) {
+fn compare_ptx(
+    name: &str,
+    pass_name: &OsStr,
+    ptx_in: &str,
+    actual_ptx_out: &str,
+    expected_ptx_out: &str,
+) {
     if actual_ptx_out != expected_ptx_out {
-        maybe_save_output(name, ptx_in, actual_ptx_out);
+        maybe_save_output(name, pass_name, ptx_in, actual_ptx_out);
         let comparison = pretty_assertions::StrComparison::new(expected_ptx_out, actual_ptx_out);
         panic!("assertion failed: `(left == right)`\n\n{}", comparison);
     }
     if actual_ptx_out == "" {
-        maybe_save_output(name, ptx_in, actual_ptx_out);
+        maybe_save_output(name, pass_name, ptx_in, actual_ptx_out);
         panic!("missing expected output");
     }
 }
 
-fn maybe_save_output(name: &str, ptx_in: &str, actual_ptx_out: &str) {
+fn maybe_save_output(name: &str, pass_name: &OsStr, ptx_in: &str, actual_ptx_out: &str) {
     let output_dir = env::var("TEST_PTX_PASS_FAIL_DIR");
     if let Ok(output_dir) = output_dir {
-        let output_dir = Path::new(&output_dir);
+        let output_dir = Path::new(&output_dir).join(pass_name);
         fs::create_dir_all(&output_dir).unwrap();
         let output_file = output_dir.join(format!("{}.ptx", name));
         let mut output_file = File::create(output_file).unwrap();
         output_file.write_all(ptx_in.as_bytes()).unwrap();
         output_file.write_all(b"\n\n// %%% output %%%\n\n").unwrap();
         output_file.write_all(actual_ptx_out.as_bytes()).unwrap();
+        if !actual_ptx_out.ends_with("\n") {
+            output_file.write_all(b"\n").unwrap();
+        }
     }
 }

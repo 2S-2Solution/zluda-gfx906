@@ -11,6 +11,7 @@ thread_local! {
 
 pub(crate) struct Context {
     pub(crate) device: hipDevice_t,
+    pub(crate) alloc_stream: hipStream_t,
     pub(crate) state: Mutex<ContextState>,
 }
 
@@ -20,6 +21,8 @@ pub(crate) struct ContextState {
     pub(crate) modules: FxHashSet<CUmodule>,
     pub(crate) storage: FxHashMap<usize, StorageData>,
 }
+
+unsafe impl Send for ContextState {}
 
 pub(crate) struct StorageData {
     pub(crate) value: usize,
@@ -61,11 +64,14 @@ impl ContextState {
 }
 
 impl Context {
-    pub(crate) fn new(device: hipDevice_t) -> Self {
-        Self {
-            device: device,
+    pub(crate) fn new(device: hipDevice_t) -> Result<Self, CUerror> {
+        let mut alloc_stream = unsafe { std::mem::zeroed() };
+        unsafe { hipStreamCreateWithFlags(&mut alloc_stream, hipStreamNonBlocking) }?;
+        Ok(Self {
+            device,
+            alloc_stream,
             state: Mutex::new(ContextState::new()),
-        }
+        })
     }
 
     pub(crate) fn with_state(&self, fn_: impl FnOnce(&ContextState) -> CUresult) -> CUresult {
@@ -149,8 +155,39 @@ pub(crate) fn set_limit(limit: hipLimit_t, value: usize) -> hipError_t {
     unsafe { hipDeviceSetLimit(limit, value) }
 }
 
+pub(crate) fn set_cache_config(config: CUfunc_cache) -> CUresult {
+    get_current_context()?;
+    match config {
+        CUfunc_cache::CU_FUNC_CACHE_PREFER_NONE
+        | CUfunc_cache::CU_FUNC_CACHE_PREFER_SHARED
+        | CUfunc_cache::CU_FUNC_CACHE_PREFER_L1
+        | CUfunc_cache::CU_FUNC_CACHE_PREFER_EQUAL => Ok(()),
+        _ => Err(CUerror::INVALID_VALUE),
+    }
+}
+
 pub(crate) fn synchronize() -> hipError_t {
     unsafe { hipDeviceSynchronize() }
+}
+
+pub(crate) fn synchronize_v2(ctx: &Context) -> hipError_t {
+    let mut current_device = 0;
+    unsafe { hipGetDevice(&mut current_device)? };
+    let _dev_drop = if current_device != ctx.device {
+        unsafe { hipSetDevice(ctx.device) }?;
+        Some(SetDeviceOnDrop(current_device))
+    } else {
+        None
+    };
+    unsafe { hipDeviceSynchronize() }
+}
+
+struct SetDeviceOnDrop(i32);
+
+impl Drop for SetDeviceOnDrop {
+    fn drop(&mut self) {
+        unsafe { hipSetDevice(self.0) }.ok();
+    }
 }
 
 pub(crate) fn set_current(raw_ctx: CUcontext) -> CUresult {
@@ -249,11 +286,20 @@ pub(crate) unsafe fn create_v2(
     _flags: ::core::ffi::c_uint,
     dev: cuda_types::cuda::CUdevice,
 ) -> CUresult {
-    let handle = Context::wrap(Context::new(dev));
+    let handle = Context::wrap(Context::new(dev)?);
     // TODO: optimize
     set_current(handle)?;
     *ctx = handle;
     Ok(())
+}
+
+pub(crate) unsafe fn create_v4(
+    ctx: &mut CUcontext,
+    _ctx_create_params: Option<&mut cuda_types::cuda::CUctxCreateParams>,
+    flags: ::core::ffi::c_uint,
+    dev: cuda_types::cuda::CUdevice,
+) -> CUresult {
+    create_v2(ctx, flags, dev)
 }
 
 pub(crate) unsafe fn destroy_v2(ctx: CUcontext) -> CUresult {
@@ -289,6 +335,15 @@ pub(crate) unsafe fn get_api_version(
     Ok(())
 }
 
+pub(crate) unsafe fn get_shared_memory_config(config: &mut CUsharedconfig) -> CUresult {
+    *config = CUsharedconfig::CU_SHARED_MEM_CONFIG_DEFAULT_BANK_SIZE;
+    Ok(())
+}
+
+pub(crate) unsafe fn set_shared_memory_config(_: CUsharedconfig) -> CUresult {
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -310,5 +365,38 @@ mod tests {
         api.cuInit(0);
         api.cuCtxCreate_v2(&mut unsafe { mem::zeroed() }, 0, 0);
         api.cuCtxPopCurrent_v2(ptr::null_mut());
+    }
+
+    #[test_cuda]
+    fn set_cache_config_accepts_known_values(api: impl CudaApi) {
+        api.cuInit(0);
+        api.cuCtxCreate_v2(&mut unsafe { mem::zeroed() }, 0, 0);
+        for config in [
+            CUfunc_cache::CU_FUNC_CACHE_PREFER_NONE,
+            CUfunc_cache::CU_FUNC_CACHE_PREFER_SHARED,
+            CUfunc_cache::CU_FUNC_CACHE_PREFER_L1,
+            CUfunc_cache::CU_FUNC_CACHE_PREFER_EQUAL,
+        ] {
+            api.cuCtxSetCacheConfig(config);
+        }
+    }
+
+    #[test_cuda]
+    fn set_cache_config_rejects_unknown_value(api: impl CudaApi) {
+        api.cuInit(0);
+        api.cuCtxCreate_v2(&mut unsafe { mem::zeroed() }, 0, 0);
+        assert_eq!(
+            api.cuCtxSetCacheConfig_unchecked(CUfunc_cache(4)),
+            CUresult::ERROR_INVALID_VALUE
+        );
+    }
+
+    #[test_cuda]
+    fn set_cache_config_requires_current_context(api: impl CudaApi) {
+        api.cuInit(0);
+        assert_eq!(
+            api.cuCtxSetCacheConfig_unchecked(CUfunc_cache::CU_FUNC_CACHE_PREFER_NONE),
+            CUresult::ERROR_INVALID_CONTEXT
+        );
     }
 }

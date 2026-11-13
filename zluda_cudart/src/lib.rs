@@ -42,7 +42,10 @@ fn t(name: &'static str) -> cudaError_t {
 // VEGA-FIX T11:40 — extern decl di __hipRegister* esportate da amdhip64.dll v5.7.
 // Permettono di forwardare le __cudaRegister* di torch wheel pre-compiled al runtime HIP
 // per popolare la map host_func_addr → device_kernel_name che hipLaunchKernel consulta.
-#[link(name = "amdhip64")]
+// [2S, 13 nov 2026] Le altre funzioni HIP arrivano ora dallo shim Marconi (raw-dylib in
+// hip_runtime-sys); la registrazione resta sulla 5.7, e lo shim inoltra alla 5.7 i lanci, i
+// simboli e gli attributi dei kernel che non ha registrato lui.
+#[cfg_attr(windows, link(name = "amdhip64", kind = "raw-dylib"))]
 extern "C" {
     fn __hipRegisterFatBinary(data: *mut c_void) -> *mut *mut c_void;
     fn __hipRegisterFunction(

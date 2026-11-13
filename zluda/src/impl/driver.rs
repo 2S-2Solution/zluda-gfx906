@@ -1,5 +1,6 @@
-use crate::r#impl::{self, context, device, function};
+use crate::r#impl::{self, context, device, function, module};
 use cuda_types::cuda::*;
+use dark_api::FunctionArgInfo;
 use hip_runtime_sys::*;
 use libloading::Library;
 use std::{
@@ -9,7 +10,7 @@ use std::{
     sync::{Mutex, OnceLock},
     usize,
 };
-use zluda_common::{FromCuda, LiveCheck, ZludaObject};
+use zluda_common::{constants, FromCuda, LiveCheck, ZludaObject};
 
 #[cfg_attr(windows, path = "os_win.rs")]
 #[cfg_attr(not(windows), path = "os_unix.rs")]
@@ -19,7 +20,7 @@ pub(crate) struct GlobalState {
     pub devices: Vec<Device>,
     pub cache_path: Option<String>,
     pub allocations: Mutex<Allocations>,
-    pub should_zero_allocations: bool,
+    pub compute_capability: (i32, i32),
 }
 
 pub(crate) struct Allocations {
@@ -62,6 +63,8 @@ pub(crate) struct AllocationInfo {
 pub(crate) struct Device {
     pub(crate) _comgr_isa: CString,
     primary_context: LiveCheck<context::Context>,
+    #[cfg(windows)]
+    pub(crate) opencl_context: Mutex<Option<super::graphics::OpenCLContext>>,
 }
 
 impl Device {
@@ -93,7 +96,6 @@ pub(crate) fn global_state() -> Result<&'static GlobalState, CUerror> {
             unsafe { hipGetDeviceCount(&mut device_count) }?;
             let allocations = Mutex::new(Allocations::new());
             Ok(GlobalState {
-                should_zero_allocations: should_zero_allocations().unwrap_or(false),
                 allocations,
                 devices: (0..device_count)
                     .map(|i| {
@@ -105,26 +107,18 @@ pub(crate) fn global_state() -> Result<&'static GlobalState, CUerror> {
                             ))
                             .map_err(|_| CUerror::UNKNOWN)?
                             .to_owned(),
-                            primary_context: LiveCheck::new(context::Context::new(i)),
+                            primary_context: LiveCheck::new(context::Context::new(i)?),
+                            #[cfg(windows)]
+                            opencl_context: Mutex::new(None),
                         })
                     })
                     .collect::<Result<Vec<_>, _>>()?,
                 cache_path: zluda_cache::ModuleCache::create_cache_dir_and_get_path(),
+                compute_capability: constants::compute_capability(),
             })
         })
         .as_ref()
         .map_err(|e| *e)
-}
-
-fn should_zero_allocations() -> Option<bool> {
-    let current_exe_path = std::env::current_exe().ok()?;
-    let current_exe_file = current_exe_path.file_name()?;
-    let current_exe_file = current_exe_file.to_str()?.to_ascii_lowercase();
-    Some(
-        current_exe_file.contains("geekbench")
-            || current_exe_file.starts_with("train_gpt")
-            || current_exe_file.starts_with("test_gpt"),
-    )
 }
 
 pub(crate) fn init(flags: ::core::ffi::c_uint) -> CUresult {
@@ -153,14 +147,29 @@ unsafe impl<const S: usize> Sync for UnknownBuffer<S> {}
 static UNKNOWN_BUFFER1: UnknownBuffer<1024> = UnknownBuffer::new();
 static UNKNOWN_BUFFER2: UnknownBuffer<14> = UnknownBuffer::new();
 
+#[repr(C)]
+struct AllocRecord {
+    x: usize,
+    y: usize,
+}
+
 struct DarkApi {}
 
 impl ::dark_api::cuda::CudaDarkApi for DarkApi {
+    unsafe extern "system" fn primary_ctx_retain_with_flags(
+        dev: cuda_types::cuda::CUdevice,
+        flags: u32,
+    ) -> cuda_types::cuda::CUresult {
+        let mut ctx = mem::zeroed();
+        device::primary_context_retain(&mut ctx, dev)?;
+        device::primary_context_set_flags_v2(dev, flags)
+    }
+
     // VEGA-FIX T11:50 23 giu: era unimplemented = 801. torch cudart_static chiama
     // questa dark API CUDART_INTERFACE[1] per loadare i kernel CUBIN/PTX embedded
     // del wheel torch_cuda.dll. Senza impl → 801 propagato → user-space CUDA error 801.
     unsafe extern "system" fn get_module_from_cubin(
-        module: *mut cuda_types::cuda::CUmodule,
+        result: *mut cuda_types::cuda::CUmodule,
         fatbinc_wrapper: *const cuda_types::dark_api::FatbincWrapper,
     ) -> cuda_types::cuda::CUresult {
         // Log persistente per inchiodare callsite
@@ -168,7 +177,7 @@ impl ::dark_api::cuda::CudaDarkApi for DarkApi {
         if let Ok(mut f) = crate::diag("zluda_dark_api_trace.log") {
             let _ = writeln!(f, "[get_module_from_cubin] wrapper={:p}", fatbinc_wrapper);
         }
-        if module.is_null() || fatbinc_wrapper.is_null() {
+        if result.is_null() || fatbinc_wrapper.is_null() {
             return CUresult::ERROR_INVALID_VALUE;
         }
         let ptr = fatbinc_wrapper as *const ::std::ffi::c_void;
@@ -176,11 +185,12 @@ impl ::dark_api::cuda::CudaDarkApi for DarkApi {
             Ok(l) => l,
             Err(_) => return CUresult::ERROR_INVALID_VALUE,
         };
-        let (hip_module, elf_blob) = crate::r#impl::module::load_hip_module(library)?;
+        let (hip_module, sm_version, meta32, elf_blob) =
+            crate::r#impl::module::load_hip_module(library)?;
         // VEGA-FIX T12:25: wrap in ZludaObject Module (cookie+base) altrimenti
         // cuModuleGetFunction fail con ret=1 (no magic cookie validation).
-        let wrapped = crate::r#impl::module::Module::new_with_elf(hip_module, &elf_blob).wrap();
-        *module = wrapped;
+        let wrapped = crate::r#impl::module::Module::new_with_elf(hip_module, sm_version, meta32, &elf_blob).wrap();
+        *result = wrapped;
         if let Ok(mut f) = crate::diag("zluda_dark_api_trace.log") {
             let _ = writeln!(f, "  -> hip_module={:?} wrapped CUmodule={:?}", hip_module.0, wrapped.0);
         }
@@ -221,13 +231,14 @@ impl ::dark_api::cuda::CudaDarkApi for DarkApi {
             Ok(l) => l,
             Err(_) => return CUresult::ERROR_INVALID_VALUE,
         };
-        let (hip_module, elf_blob) = crate::r#impl::module::load_hip_module(library)?;
-        *result = crate::r#impl::module::Module::new_with_elf(hip_module, &elf_blob).wrap();
+        let (hip_module, sm_version, meta32, elf_blob) =
+            crate::r#impl::module::load_hip_module(library)?;
+        *result = crate::r#impl::module::Module::new_with_elf(hip_module, sm_version, meta32, &elf_blob).wrap();
         Ok(())
     }
 
-    unsafe extern "system" fn cudart_interface_fn7(_arg1: usize) -> cuda_types::cuda::CUresult {
-        Ok(())  // benign — return Ok per non bloccare
+    unsafe extern "system" fn cudart_interface_fn7(_arg1: usize) -> () {
+        ()
     }
 
     // VEGA-FIX T11:50: ext2 riceve fatbin_header (non wrapper). CodeLibraryRef::try_load
@@ -251,8 +262,9 @@ impl ::dark_api::cuda::CudaDarkApi for DarkApi {
             Ok(l) => l,
             Err(_) => return CUresult::ERROR_INVALID_VALUE,
         };
-        let (hip_module, elf_blob) = crate::r#impl::module::load_hip_module(library)?;
-        *result = crate::r#impl::module::Module::new_with_elf(hip_module, &elf_blob).wrap();
+        let (hip_module, sm_version, meta32, elf_blob) =
+            crate::r#impl::module::load_hip_module(library)?;
+        *result = crate::r#impl::module::Module::new_with_elf(hip_module, sm_version, meta32, &elf_blob).wrap();
         Ok(())
     }
 
@@ -278,21 +290,21 @@ impl ::dark_api::cuda::CudaDarkApi for DarkApi {
         value: *mut c_void,
         dtor_cb: Option<extern "system" fn(CUcontext, *mut c_void, *mut c_void)>,
     ) -> CUresult {
-        let _ctx = if cu_ctx.0 != ptr::null_mut() {
+        let ctx = if cu_ctx.0 != ptr::null_mut() {
             cu_ctx
         } else {
             let mut current_ctx: CUcontext = CUcontext(ptr::null_mut());
             context::get_current(&mut current_ctx)?;
             current_ctx
         };
-        let ctx_obj: &context::Context = FromCuda::<_, CUerror>::from_cuda(&_ctx)?;
+        let ctx_obj: &context::Context = FromCuda::<_, CUerror>::from_cuda(&ctx)?;
         ctx_obj.with_state_mut(|state: &mut context::ContextState| {
             state.storage.insert(
                 key as usize,
                 context::StorageData {
                     value: value as usize,
                     reset_cb: dtor_cb,
-                    handle: _ctx,
+                    handle: ctx,
                 },
             );
             Ok(())
@@ -304,7 +316,14 @@ impl ::dark_api::cuda::CudaDarkApi for DarkApi {
         cu_ctx: CUcontext,
         key: *mut c_void,
     ) -> CUresult {
-        let ctx_obj: &context::Context = FromCuda::<_, CUerror>::from_cuda(&cu_ctx)?;
+        let ctx = if cu_ctx.0 != ptr::null_mut() {
+            cu_ctx
+        } else {
+            let mut current_ctx: CUcontext = CUcontext(ptr::null_mut());
+            context::get_current(&mut current_ctx)?;
+            current_ctx
+        };
+        let ctx_obj: &context::Context = FromCuda::<_, CUerror>::from_cuda(&ctx)?;
         ctx_obj.with_state_mut(|state: &mut context::ContextState| {
             state.storage.remove(&(key as usize));
             Ok(())
@@ -335,26 +354,40 @@ impl ::dark_api::cuda::CudaDarkApi for DarkApi {
     }
 
     unsafe extern "system" fn ctx_create_v2_bypass(
-        _pctx: *mut cuda_types::cuda::CUcontext,
-        _flags: ::std::os::raw::c_uint,
-        _dev: cuda_types::cuda::CUdevice,
+        ctx: *mut cuda_types::cuda::CUcontext,
+        flags: ::std::os::raw::c_uint,
+        dev: cuda_types::cuda::CUdevice,
     ) -> cuda_types::cuda::CUresult {
-        Err(r#impl::unimplemented())
+        let Some(ctx) = ctx.as_mut() else {
+            return Err(CUerror::INVALID_VALUE);
+        };
+        context::create_v2(ctx, flags, dev)
     }
 
     unsafe extern "system" fn heap_alloc(
-        _heap_alloc_record_ptr: *mut *const std::ffi::c_void,
-        _arg2: usize,
-        _arg3: usize,
+        heap_alloc_record_ptr: *mut *const std::ffi::c_void,
+        arg2: usize,
+        arg3: usize,
     ) -> cuda_types::cuda::CUresult {
-        Err(r#impl::unimplemented())
+        let heap_alloc_record_ptr = heap_alloc_record_ptr as *mut *mut AllocRecord;
+        let alloc_record = Box::into_raw(Box::new(AllocRecord { x: arg2, y: arg3 }));
+        *heap_alloc_record_ptr = alloc_record;
+        Ok(())
     }
 
     unsafe extern "system" fn heap_free(
-        _heap_alloc_record_ptr: *const std::ffi::c_void,
-        _arg2: *mut usize,
+        heap_alloc_record_ptr: *const std::ffi::c_void,
+        arg2: *mut usize,
     ) -> cuda_types::cuda::CUresult {
-        Err(r#impl::unimplemented())
+        if !crate::initialized() {
+            return Err(CUerror::DEINITIALIZED);
+        }
+        let heap_alloc_record_ptr = heap_alloc_record_ptr as *mut AllocRecord;
+        let record = Box::from_raw(heap_alloc_record_ptr);
+        if !arg2.is_null() {
+            *arg2 = record.y;
+        }
+        Ok(())
     }
 
     unsafe extern "system" fn device_get_attribute_ext(
@@ -454,6 +487,10 @@ impl ::dark_api::cuda::CudaDarkApi for DarkApi {
         }
         CUresult::SUCCESS
     }
+
+    unsafe extern "system" fn load_compilers() -> cuda_types::cuda::CUresult {
+        CUresult::SUCCESS
+    }
 }
 
 static HYBRID_RUNTIME_HANDLE: Mutex<Option<Library>> = Mutex::new(None);
@@ -501,11 +538,99 @@ fn get_device_hash_info() -> Result<Vec<::dark_api::DeviceHashinfo>, CUerror> {
 static EXPORT_TABLE: ::dark_api::cuda::CudaDarkApiGlobalTable =
     ::dark_api::cuda::CudaDarkApiGlobalTable::new::<DarkApi>();
 
+struct Zluda32DarkApi {}
+
+impl ::dark_api::zluda32::CudaDarkApi for Zluda32DarkApi {
+    unsafe extern "system" fn get_module_globals(
+        names: *mut *mut u8,
+        initializers: *mut *const u8,
+        sizes: *mut u32,
+        alignments: *mut u32,
+        count: *mut u32,
+        module: cuda_types::cuda::CUmodule,
+    ) -> cuda_types::cuda::CUresult {
+        let module: &module::Module = FromCuda::<_, CUerror>::from_cuda(&module)?;
+        let zluda32 = module.bit32.as_ref().ok_or(CUerror::NOT_FOUND)?;
+        if let Some(c) = count.as_mut() {
+            *c = zluda32.globals.len() as u32;
+        }
+        let mut names = if names.is_null() {
+            None
+        } else {
+            Some(slice::from_raw_parts_mut(names, zluda32.globals.len()))
+        };
+        let mut initializers = if initializers.is_null() {
+            None
+        } else {
+            Some(slice::from_raw_parts_mut(
+                initializers,
+                zluda32.globals.len(),
+            ))
+        };
+        let mut sizes = if sizes.is_null() {
+            None
+        } else {
+            Some(slice::from_raw_parts_mut(sizes, zluda32.globals.len()))
+        };
+        let mut alignments = if alignments.is_null() {
+            None
+        } else {
+            Some(slice::from_raw_parts_mut(alignments, zluda32.globals.len()))
+        };
+        if names.is_some() || initializers.is_some() || sizes.is_some() || alignments.is_some() {
+            for (i, global) in zluda32.globals.iter().enumerate() {
+                if let Some(names) = &mut names {
+                    names[i] = global.name.as_ptr() as *mut u8;
+                }
+                if let Some(initializers) = &mut initializers {
+                    initializers[i] = global.initializer.as_ptr();
+                }
+                if let Some(sizes) = &mut sizes {
+                    sizes[i] = global.initializer.len() as u32;
+                }
+                if let Some(alignments) = &mut alignments {
+                    alignments[i] = global.align as u32;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    unsafe extern "system" fn get_function_info(
+        explicit_sizes_out: *mut FunctionArgInfo,
+        explicit_count_out: *mut u32,
+        func: cuda_types::cuda::CUfunction,
+    ) -> cuda_types::cuda::CUresult {
+        let func: &function::Function = FromCuda::<_, CUerror>::from_cuda(&func)?;
+        let explicit_args_size_align = match &func.explicit_args_size_align {
+            Some(sizes) => sizes,
+            None => return CUresult::ERROR_NOT_FOUND,
+        };
+        if !explicit_sizes_out.is_null() {
+            std::ptr::copy_nonoverlapping(
+                explicit_args_size_align.as_ptr(),
+                explicit_sizes_out,
+                explicit_args_size_align.len(),
+            );
+        }
+        if let Some(explicit_count_out) = explicit_count_out.as_mut() {
+            *explicit_count_out = explicit_args_size_align.len() as u32;
+        }
+        Ok(())
+    }
+}
+
+static ZLUDA32_EXPORT_TABLE: ::dark_api::zluda32::CudaDarkApiGlobalTable =
+    ::dark_api::zluda32::CudaDarkApiGlobalTable::new::<Zluda32DarkApi>();
+
 pub(crate) fn get_export_table(
     pp_export_table: &mut *const ::core::ffi::c_void,
     p_export_table_id: &CUuuid,
 ) -> CUresult {
     if let Some(table) = EXPORT_TABLE.get(p_export_table_id) {
+        *pp_export_table = table.start();
+        cuda_types::cuda::CUresult::SUCCESS
+    } else if let Some(table) = ZLUDA32_EXPORT_TABLE.get(p_export_table_id) {
         *pp_export_table = table.start();
         cuda_types::cuda::CUresult::SUCCESS
     } else {
@@ -582,26 +707,32 @@ pub(crate) unsafe fn thread_exchange_stream_capture_mode(
 
 pub(crate) unsafe fn occupancy_max_active_blocks_per_multiprocessor_with_flags(
     num_blocks: &mut ::core::ffi::c_int,
-    func: hipFunction_t,
+    func: &function::Function,
     block_size: ::core::ffi::c_int,
     dynamic_smem_size: usize,
     flags: ::core::ffi::c_uint,
 ) -> hipError_t {
     hipModuleOccupancyMaxActiveBlocksPerMultiprocessorWithFlags(
         num_blocks,
-        func,
+        func.base,
         block_size,
         dynamic_smem_size,
         flags,
     )?;
-    *num_blocks = (*num_blocks).max(1);
+    let mut max_block_size = 0;
+    hipFuncGetAttribute(
+        &mut max_block_size,
+        hipFunction_attribute::HIP_FUNC_ATTRIBUTE_MAX_THREADS_PER_BLOCK,
+        func.base,
+    )?;
+    *num_blocks = (*num_blocks).max(1).min(max_block_size);
     Ok(())
 }
 
 pub(crate) unsafe fn occupancy_max_potential_block_size(
     grid_size: &mut ::core::ffi::c_int,
     block_size: &mut ::core::ffi::c_int,
-    f: hipFunction_t,
+    f: &function::Function,
     _block_size_to_dynamic_smem_size: CUoccupancyB2DSize,
     dyn_shared_mem_per_blk: usize,
     block_size_limit: ::core::ffi::c_int,
@@ -609,16 +740,23 @@ pub(crate) unsafe fn occupancy_max_potential_block_size(
     hipModuleOccupancyMaxPotentialBlockSize(
         grid_size,
         block_size,
-        f,
+        f.base,
         dyn_shared_mem_per_blk,
         block_size_limit,
     )?;
+    let mut max_block_size = 0;
+    hipFuncGetAttribute(
+        &mut max_block_size,
+        hipFunction_attribute::HIP_FUNC_ATTRIBUTE_MAX_THREADS_PER_BLOCK,
+        f.base,
+    )?;
+    *block_size = (*block_size).min(max_block_size);
     Ok(())
 }
 
 pub(crate) unsafe fn launch_kernel_ex(
     config: &cuda_types::cuda::CUlaunchConfig,
-    f: hipFunction_t,
+    f: &function::Function,
     kernel_params: *mut *mut ::core::ffi::c_void,
     extra: *mut *mut ::core::ffi::c_void,
 ) -> CUresult {
@@ -814,12 +952,10 @@ pub(crate) unsafe fn link_add_file_ex(
 
 #[cfg(test)]
 mod tests {
-    use std::i32;
-
     use crate::r#impl::driver::AllocationInfo;
     use crate::tests::CudaApi;
     use cuda_macros::test_cuda;
-    use cuda_types::cuda::CUcontext;
+    use cuda_types::cuda::*;
 
     #[test_cuda]
     fn init(api: impl CudaApi) {
@@ -889,5 +1025,23 @@ mod tests {
         let mut primary_ctx = std::mem::zeroed();
         api.cuDevicePrimaryCtxRetain(&mut primary_ctx, 0);
         assert_eq!(dark_ctx.0, primary_ctx.0);
+    }
+
+    #[test_cuda]
+    unsafe fn primary_ctx_set_flags(api: impl CudaApi) {
+        api.cuInit(0);
+        let mut table_ptr = std::ptr::null();
+        api.cuGetExportTable(&mut table_ptr, &dark_api::cuda::CudartInterface::GUID);
+        let cuda_rt_iface = dark_api::cuda::CudartInterface::new(table_ptr);
+        cuda_rt_iface.primary_ctx_retain_with_flags(0, 2).unwrap();
+        let mut flags = u32::MAX;
+        let mut active = i32::MAX;
+        api.cuDevicePrimaryCtxGetState(0, &mut flags, &mut active);
+        assert_eq!(flags, 2);
+        assert_eq!(active, 1);
+        api.cuDevicePrimaryCtxReset_v2(0);
+        api.cuDevicePrimaryCtxGetState(0, &mut flags, &mut active);
+        assert_eq!(flags, 0);
+        assert_eq!(active, 0);
     }
 }

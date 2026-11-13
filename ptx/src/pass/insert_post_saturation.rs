@@ -23,8 +23,8 @@ fn run_directive<'input>(
 
 fn run_method<'input>(
     resolver: &mut GlobalStringIdentResolver2,
-    method: Function2<ast::Instruction<SpirvWord>, SpirvWord>,
-) -> Result<Function2<ast::Instruction<SpirvWord>, SpirvWord>, TranslateError> {
+    method: Function<ast::Instruction<SpirvWord>, SpirvWord>,
+) -> Result<Function<ast::Instruction<SpirvWord>, SpirvWord>, TranslateError> {
     let mut new_statements = Vec::new();
     let body = method
         .body
@@ -35,7 +35,7 @@ fn run_method<'input>(
             Ok::<_, TranslateError>(new_statements)
         })
         .transpose()?;
-    Ok(Function2 { body, ..method })
+    Ok(Function { body, ..method })
 }
 
 fn run_statement<'input>(
@@ -71,8 +71,9 @@ fn run_instruction<'input>(
             data: ast::ArithDetails::Integer(..),
             ..
         }
-        | ast::Instruction::AddCarry { .. }
-        | ast::Instruction::MadCarry { .. }
+        | ast::Instruction::AddExtended { .. }
+        | ast::Instruction::SubExtended { .. }
+        | ast::Instruction::MadExtended { .. }
         | ast::Instruction::And { .. }
         | ast::Instruction::Atom { .. }
         | ast::Instruction::AtomCas { .. }
@@ -81,6 +82,7 @@ fn run_instruction<'input>(
         | ast::Instruction::BarRed { .. }
         | ast::Instruction::Bfe { .. }
         | ast::Instruction::Bfi { .. }
+        | ast::Instruction::Bmsk { .. }
         | ast::Instruction::Bra { .. }
         | ast::Instruction::Brev { .. }
         | ast::Instruction::Call { .. }
@@ -128,7 +130,6 @@ fn run_instruction<'input>(
         | ast::Instruction::Cvta { .. }
         | ast::Instruction::Div { .. }
         | ast::Instruction::Dp4a { .. }
-        | ast::Instruction::Vshr { .. }
         | ast::Instruction::Ex2 { .. }
         | ast::Instruction::Fma {
             data: ast::ArithFloat {
@@ -180,7 +181,8 @@ fn run_instruction<'input>(
         | ast::Instruction::SetBool { .. }
         | ast::Instruction::Setp { .. }
         | ast::Instruction::SetpBool { .. }
-        | ast::Instruction::ShflSync { .. }
+        | ast::Instruction::Shfl { .. }
+        | ast::Instruction::MatchSync { .. }
         | ast::Instruction::Shf { .. }
         | ast::Instruction::Shl { .. }
         | ast::Instruction::Shr { .. }
@@ -207,7 +209,13 @@ fn run_instruction<'input>(
         | ast::Instruction::GridDepControl { .. }
         | ast::Instruction::LdMatrix { .. }
         | ast::Instruction::Prefetch { .. }
-        | ast::Instruction::Mma { .. } => result.push(Statement::Instruction(instruction)),
+        | ast::Instruction::Sad { .. }
+        | ast::Instruction::Dp2a { .. }
+        | ast::Instruction::Tex { .. }
+        | ast::Instruction::Suld { .. }
+        | ast::Instruction::Sust { .. }
+        | ast::Instruction::Mma { .. }
+        | ast::Instruction::Vshr { .. } => result.push(Statement::Instruction(instruction)),
         ast::Instruction::Add {
             data:
                 ast::ArithDetails::Float(ast::ArithFloat {

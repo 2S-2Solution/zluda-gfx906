@@ -25,11 +25,11 @@ fn run_directive<'input>(
 
 fn run_method<'input>(
     resolver: &mut GlobalStringIdentResolver2<'input>,
-    method: Function2<
+    method: Function<
         ast::Instruction<ast::ParsedOperand<SpirvWord>>,
         ast::ParsedOperand<SpirvWord>,
     >,
-) -> Result<Function2<ast::Instruction<SpirvWord>, SpirvWord>, TranslateError> {
+) -> Result<Function<ast::Instruction<SpirvWord>, SpirvWord>, TranslateError> {
     let body = method
         .body
         .map(|statements| {
@@ -40,7 +40,7 @@ fn run_method<'input>(
             Ok::<_, TranslateError>(result)
         })
         .transpose()?;
-    Ok(Function2 {
+    Ok(Function {
         body,
         return_arguments: method.return_arguments,
         name: method.name,
@@ -48,11 +48,8 @@ fn run_method<'input>(
         import_as: method.import_as,
         tuning: method.tuning,
         linkage: method.linkage,
-        is_kernel: method.is_kernel,
-        flush_to_zero_f32: method.flush_to_zero_f32,
-        flush_to_zero_f16f64: method.flush_to_zero_f16f64,
-        rounding_mode_f32: method.rounding_mode_f32,
-        rounding_mode_f16f64: method.rounding_mode_f16f64,
+        kernel_attributes: method.kernel_attributes,
+        kernel_meta32: method.kernel_meta32,
     })
 }
 
@@ -92,7 +89,7 @@ impl<'a, 'input> FlattenArguments<'a, 'input> {
     fn reg_offset(
         &mut self,
         reg: SpirvWord,
-        offset: i32,
+        offset: i64,
         type_space: Option<(&ast::Type, ast::StateSpace)>,
         _is_dst: bool,
     ) -> Result<SpirvWord, TranslateError> {
@@ -117,7 +114,7 @@ impl<'a, 'input> FlattenArguments<'a, 'input> {
             self.result.push(Statement::Constant(ConstantDefinition {
                 dst: id_constant_stmt,
                 typ: reg_scalar_type,
-                value: ast::ImmediateValue::S64(offset as i64),
+                value: ast::ImmediateValue::S64(offset),
             }));
             let arith_details = match reg_scalar_type.kind() {
                 ast::ScalarKind::Signed => ast::ArithDetails::Integer(ast::ArithInteger {
@@ -183,6 +180,13 @@ impl<'a, 'input> FlattenArguments<'a, 'input> {
         let id = self
             .resolver
             .register_unnamed(Some((ast::Type::Scalar(scalar_t), state_space)));
+
+        let value = if scalar_t.kind() == ast::ScalarKind::Bit {
+            ast::ImmediateValue::U64(value.get_bits())
+        } else {
+            value
+        };
+
         self.result.push(Statement::Constant(ConstantDefinition {
             dst: id,
             typ: scalar_t,
@@ -230,7 +234,7 @@ impl<'a, 'input> FlattenArguments<'a, 'input> {
 
     fn vec_pack(
         &mut self,
-        vector_elements: Vec<ast::RegOrImmediate<SpirvWord>>,
+        vector_elements: Vec<Option<ast::RegOrImmediate<SpirvWord>>>,
         type_space: Option<(&ast::Type, ast::StateSpace)>,
         is_dst: bool,
         relaxed_type_check: bool,
@@ -250,11 +254,15 @@ impl<'a, 'input> FlattenArguments<'a, 'input> {
         let vector_elements = vector_elements
             .into_iter()
             .map(|element| match element {
-                ast::RegOrImmediate::Reg(name) => self.reg(name),
-                ast::RegOrImmediate::Imm(immediate_value) => self.immediate(
-                    immediate_value,
-                    Some((&ast::Type::Scalar(scalar_t), state_space)),
-                ),
+                Some(ast::RegOrImmediate::Reg(name)) => self.reg(name).map(Some),
+                Some(ast::RegOrImmediate::Imm(immediate_value)) => self
+                    .immediate(
+                        immediate_value,
+                        Some((&ast::Type::Scalar(scalar_t), state_space)),
+                    )
+                    .map(Some),
+                None if is_dst => Ok(None),
+                None => Err(error_mismatched_type()),
             })
             .collect::<Result<Vec<_>, _>>()?;
         let temporary_vector = self

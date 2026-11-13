@@ -1,8 +1,9 @@
 // This file contains a higher-level interface for parsing fatbins
 
-use std::{borrow::Cow, ptr};
-
 use cuda_types::dark_api::*;
+use flate2::read::ZlibDecoder;
+use std::io::{self, Read};
+use std::{borrow::Cow, ptr};
 
 pub enum ParseError {
     NullPointer(&'static str),
@@ -37,6 +38,7 @@ pub enum FatbinError {
     ParseFailure(ParseError),
     Lz4DecompressionFailure,
     ZstdDecompressionFailure(usize),
+    DeflateDecompressionFailure(io::Error),
 }
 
 pub fn parse_fatbinc_wrapper<T: Sized>(ptr: &*const T) -> Result<&FatbincWrapper, ParseError> {
@@ -196,7 +198,10 @@ impl<'a> FatbinFile<'a> {
         std::slice::from_raw_parts(start, self.header.compressed_size as usize)
     }
 
-    pub unsafe fn get_or_decompress_content(self) -> Result<Cow<'a, [u8]>, FatbinError> {
+    pub unsafe fn get_or_decompress_content(
+        self,
+        strip_trailing_zero: bool,
+    ) -> Result<Cow<'a, [u8]>, FatbinError> {
         let mut payload = if self
             .header
             .flags
@@ -209,12 +214,17 @@ impl<'a> FatbinFile<'a> {
             .contains(FatbinFileHeaderFlags::CompressedZstd)
         {
             Cow::Owned(unsafe { decompress_zstd(self) }?)
+        } else if self
+            .header
+            .flags
+            .contains(FatbinFileHeaderFlags::CompressedDeflate)
+        {
+            Cow::Owned(unsafe { decompress_deflate(self) }?)
         } else {
             Cow::Borrowed(unsafe { self.get_non_compressed_payload() })
         };
-
         // Remove trailing zeros
-        if self.header.kind == FatbinFileHeader::HEADER_KIND_PTX {
+        if strip_trailing_zero && self.header.kind == FatbinFileHeader::HEADER_KIND_PTX {
             match payload {
                 Cow::Borrowed(ref mut slice) => {
                     while slice.last() == Some(&0) {
@@ -306,5 +316,17 @@ pub unsafe fn decompress_zstd(file: FatbinFile) -> Result<Vec<u8>, FatbinError> 
             Ok(result)
         }
         Err(err) => Err(FatbinError::ZstdDecompressionFailure(err)),
+    }
+}
+
+pub unsafe fn decompress_deflate(file: FatbinFile) -> Result<Vec<u8>, FatbinError> {
+    let mut result = Vec::with_capacity(file.header.uncompressed_payload as usize);
+    let mut decoder = ZlibDecoder::new(file.get_non_compressed_payload());
+    match decoder.read_to_end(&mut result) {
+        Ok(actual_size) => {
+            result.truncate(actual_size);
+            Ok(result)
+        }
+        Err(err) => Err(FatbinError::DeflateDecompressionFailure(err)),
     }
 }

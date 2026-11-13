@@ -1,29 +1,53 @@
 #![cfg(windows)]
 use std::{
     ffi::{c_void, CStr, CString, OsString},
-    iter,
+    iter, mem,
     ops::ControlFlow,
     os::windows::ffi::{OsStrExt, OsStringExt},
     path::PathBuf,
+    ptr,
 };
 use trie_hard::TrieHard;
 use uuid::uuid;
-use widestring::{u16str, U16Str};
+use widestring::{u16str, U16Str, U16String};
 use windows::{
-    core::PCWSTR,
+    core::{w, HRESULT, PCWSTR},
     Win32::{
-        Foundation::HMODULE,
-        System::LibraryLoader::{
-            GetModuleFileNameA, GetModuleFileNameW, GetModuleHandleExW, LoadLibraryExW,
-            GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS, GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
-            LOAD_LIBRARY_SEARCH_DEFAULT_DIRS, LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR,
+        Foundation::{HANDLE, HINSTANCE, HMODULE, HWND, LPARAM, S_OK, WPARAM},
+        System::{
+            JobObjects::{
+                AssignProcessToJobObject, JobObjectExtendedLimitInformation,
+                SetInformationJobObject, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
+                JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+            },
+            LibraryLoader::{
+                GetModuleFileNameA, GetModuleFileNameW, GetModuleHandleExW, LoadLibraryExW,
+                GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS,
+                GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, LOAD_LIBRARY_SEARCH_DEFAULT_DIRS,
+                LOAD_LIBRARY_FLAGS, LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR,
+            },
+            StationsAndDesktops::{
+                GetProcessWindowStation, GetUserObjectInformationW, UOI_FLAGS, USEROBJECTFLAGS,
+            },
+        },
+        UI::{
+            Controls::{
+                TaskDialogIndirect, TASKDIALOGCONFIG, TASKDIALOGCONFIG_0, TASKDIALOGCONFIG_1,
+                TASKDIALOG_NOTIFICATIONS, TDCBF_CLOSE_BUTTON, TDF_ENABLE_HYPERLINKS,
+                TDN_HYPERLINK_CLICKED, TD_ERROR_ICON,
+            },
+            WindowsAndMessaging::{IDCLOSE, WSF_VISIBLE},
         },
     },
 };
 
-pub static LIBRARIES: [LibraryInfo; 12] = [
-    NVCUDA, NVML, DNN8, DNN9, BLAS13, BLAS12, BLAS_LT13, BLAS_LT12, SPARSE12, SPARSE11, FFT12,
-    FFT11,
+#[cfg(target_pointer_width = "32")]
+pub static LIBRARIES: [LibraryInfo; 2] = [NVCUDA, NVAPI];
+
+#[cfg(target_pointer_width = "64")]
+pub static LIBRARIES: [LibraryInfo; 17] = [
+    NVCUDA, NVML, DNN8, DNN9, BLAS13, BLAS12, BLAS11, BLAS_LT13, BLAS_LT12, BLAS_LT11, SPARSE12,
+    SPARSE11, SPARSE10, FFT12, FFT11, FFT10, NVAPI,
 ];
 
 pub const NVCUDA: LibraryInfo = LibraryInfo {
@@ -86,8 +110,18 @@ pub const BLAS12: LibraryInfo = LibraryInfo {
     in_system32: false,
 };
 
+pub const BLAS11: LibraryInfo = LibraryInfo {
+    short_name: "cublas11",
+    is_alias: true,
+    ascii_name: "cublas64_11.dll",
+    utf16_name: u16str!("cublas64_11.dll"),
+    guid: uuid!("3ca5e756-ed7e-4235-a7f4-952e5140f8f6"),
+    trace_env_var: "ZLUDA_BLAS_LIB",
+    in_system32: false,
+};
+
 pub const BLAS_LT13: LibraryInfo = LibraryInfo {
-    short_name: "cublaslt",
+    short_name: "cublaslt13",
     is_alias: false,
     ascii_name: "cublaslt64_13.dll",
     utf16_name: u16str!("cublaslt64_13.dll"),
@@ -97,7 +131,7 @@ pub const BLAS_LT13: LibraryInfo = LibraryInfo {
 };
 
 pub const BLAS_LT12: LibraryInfo = LibraryInfo {
-    short_name: "cublaslt",
+    short_name: "cublaslt12",
     is_alias: true,
     ascii_name: "cublaslt64_12.dll",
     utf16_name: u16str!("cublaslt64_12.dll"),
@@ -106,8 +140,18 @@ pub const BLAS_LT12: LibraryInfo = LibraryInfo {
     in_system32: false,
 };
 
+pub const BLAS_LT11: LibraryInfo = LibraryInfo {
+    short_name: "cublaslt11",
+    is_alias: true,
+    ascii_name: "cublaslt64_11.dll",
+    utf16_name: u16str!("cublaslt64_11.dll"),
+    guid: uuid!("59413153-dbcd-45e1-aa78-b4df4197b447"),
+    trace_env_var: "ZLUDA_BLASLT_LIB",
+    in_system32: false,
+};
+
 pub const SPARSE12: LibraryInfo = LibraryInfo {
-    short_name: "cusparse",
+    short_name: "cusparse12",
     is_alias: false,
     ascii_name: "cusparse64_12.dll",
     utf16_name: u16str!("cusparse64_12.dll"),
@@ -117,7 +161,7 @@ pub const SPARSE12: LibraryInfo = LibraryInfo {
 };
 
 pub const SPARSE11: LibraryInfo = LibraryInfo {
-    short_name: "cusparse",
+    short_name: "cusparse11",
     is_alias: true,
     ascii_name: "cusparse64_11.dll",
     utf16_name: u16str!("cusparse64_11.dll"),
@@ -126,8 +170,18 @@ pub const SPARSE11: LibraryInfo = LibraryInfo {
     in_system32: false,
 };
 
+pub const SPARSE10: LibraryInfo = LibraryInfo {
+    short_name: "cusparse10",
+    is_alias: true,
+    ascii_name: "cusparse64_10.dll",
+    utf16_name: u16str!("cusparse64_10.dll"),
+    guid: uuid!("b2502d2a-7aa5-4fa6-9ee7-b8acf9e66679"),
+    trace_env_var: "ZLUDA_SPARSE_LIB",
+    in_system32: false,
+};
+
 pub const FFT12: LibraryInfo = LibraryInfo {
-    short_name: "cufft",
+    short_name: "cufft12",
     is_alias: false,
     ascii_name: "cufft64_12.dll",
     utf16_name: u16str!("cufft64_12.dll"),
@@ -137,13 +191,39 @@ pub const FFT12: LibraryInfo = LibraryInfo {
 };
 
 pub const FFT11: LibraryInfo = LibraryInfo {
-    short_name: "cufft",
+    short_name: "cufft11",
     is_alias: true,
     ascii_name: "cufft64_11.dll",
     utf16_name: u16str!("cufft64_11.dll"),
     guid: uuid!("34d2be7e-e992-4aee-8502-b5fc14a02db3"),
     trace_env_var: "ZLUDA_FFT_LIB",
     in_system32: false,
+};
+
+pub const FFT10: LibraryInfo = LibraryInfo {
+    short_name: "cufft10",
+    is_alias: true,
+    ascii_name: "cufft64_10.dll",
+    utf16_name: u16str!("cufft64_10.dll"),
+    guid: uuid!("5f199520-4f7c-4fcb-b2b0-0e8b99f15e81"),
+    trace_env_var: "ZLUDA_FFT_LIB",
+    in_system32: false,
+};
+
+pub const NVAPI: LibraryInfo = LibraryInfo {
+    short_name: "nvapi",
+    is_alias: false,
+    #[cfg(target_pointer_width = "32")]
+    ascii_name: "nvapi.dll",
+    #[cfg(target_pointer_width = "64")]
+    ascii_name: "nvapi64.dll",
+    #[cfg(target_pointer_width = "32")]
+    utf16_name: u16str!("nvapi.dll"),
+    #[cfg(target_pointer_width = "64")]
+    utf16_name: u16str!("nvapi64.dll"),
+    guid: uuid!("f7449ed6-d01c-4376-9fc4-446eb2e4cf70"),
+    trace_env_var: "ZLUDA_NVAPI_LIB",
+    in_system32: true,
 };
 
 #[derive(Debug)]
@@ -287,9 +367,9 @@ pub struct DelayLoadInfo {
 }
 
 #[repr(C)]
-enum DliNotify {
+pub enum DliNotify {
     _NoteStartProcessing,
-    _NotePreLoadLibrary,
+    NotePreLoadLibrary,
     _NotePreGetProcAddress,
     FailLoadLib,
     _FailGetProc,
@@ -299,31 +379,219 @@ enum DliNotify {
 pub type PfnDliHook =
     unsafe extern "system" fn(dli_notify: u32, pdli: *const DelayLoadInfo) -> *mut std::ffi::c_void;
 
+pub unsafe extern "system" fn open_already_loaded_amdhip_probe_perflibs(
+    dli_notify: u32,
+    pdli: *const DelayLoadInfo,
+) -> *mut std::ffi::c_void {
+    open_already_loaded_amdhip_impl(true, dli_notify, pdli)
+}
+
+pub unsafe extern "system" fn open_already_loaded_amdhip(
+    dli_notify: u32,
+    pdli: *const DelayLoadInfo,
+) -> *mut std::ffi::c_void {
+    open_already_loaded_amdhip_impl(false, dli_notify, pdli)
+}
+
+unsafe extern "system" fn open_already_loaded_amdhip_impl(
+    probe_perflibs: bool,
+    dli_notify: u32,
+    pdli: *const DelayLoadInfo,
+) -> *mut std::ffi::c_void {
+    unsafe fn redirect_amdhip_impl(
+        probe_perflibs: bool,
+        dli_notify: u32,
+        pdli: *const DelayLoadInfo,
+    ) -> Option<HMODULE> {
+        delay_load_check(
+            ("amdhip64_7.dll", DliNotify::NotePreLoadLibrary),
+            dli_notify,
+            pdli,
+        )?;
+        // This is extremally dumb, but there's not much better we can do.
+        // We do this because we want to avoid this ordering of events:
+        // * First we load ROCm 7 runtime
+        // * Later on a performance library (rocBLAS) loads ROCm 6 runtime
+        // * Things explode
+        if probe_perflibs {
+            try_load_from_self_or_hip("hipblaslt.dll")
+                .or_else(|| try_load_from_self_or_hip("libhipblaslt.dll"))
+                .or_else(|| try_load_from_self_or_hip("rocblas.dll"))
+                .or_else(|| try_load_from_self_or_hip("rocsparse.dll"))
+                .or_else(|| try_load_from_self_or_hip("miopen.dll"));
+        }
+        let mut module = mem::zeroed();
+        GetModuleHandleExW(0, w!("amdhip64_7.dll"), &mut module)
+            .ok()
+            .or_else(|| GetModuleHandleExW(0, w!("amdhip64_6.dll"), &mut module).ok())?;
+        Some(module)
+    }
+    match redirect_amdhip_impl(probe_perflibs, dli_notify, pdli) {
+        Some(lib) => lib.0,
+        None => std::ptr::null_mut(),
+    }
+}
+
 pub unsafe fn delay_load_failure_hook(
     redirect_name: &'static str,
+    alt_name: Option<&'static str>,
     dli_notify: u32,
     pdli: *const DelayLoadInfo,
 ) -> Option<HMODULE> {
-    if dli_notify != DliNotify::FailLoadLib as u32 {
+    delay_load_check((redirect_name, DliNotify::FailLoadLib), dli_notify, pdli)?;
+    [redirect_name]
+        .iter()
+        .copied()
+        .chain(alt_name)
+        .find_map(|name| unsafe { try_load_from_self_or_hip(name) })
+}
+
+pub unsafe fn try_load_from_self_or_hip(redirect_name: &'static str) -> Option<HMODULE> {
+    try_load_from_self_dir(redirect_name)
+        .or_else(|| try_load_gfx906(redirect_name))
+        .or_else(|| try_load_from_hip_path(redirect_name))
+}
+
+// 2 Solution (gfx906): the ROCm libraries for gfx906 (rocBLAS, hipBLASLt, MIOpen, ...) come from the
+// rocm-marconi and miopen-gfx906 packages, whose bin folders are in the PATH, not from the HIP SDK.
+// HIP_PATH may point to a HIP SDK 6.x/7.x (C:\Program Files\AMD\ROCm\6.2 on our test machine) whose
+// libraries are built for another runtime and other GPUs, so it is only the last resort.
+// The bare-name load comes first: it returns the module already loaded under that name, if any,
+// so a library imported at load time and one loaded here are never two different copies.
+unsafe fn try_load_gfx906(redirect_name: &'static str) -> Option<HMODULE> {
+    let by_name = redirect_name
+        .encode_utf16()
+        .chain(iter::once(0))
+        .collect::<Vec<_>>();
+    if let Ok(module) = LoadLibraryExW(PCWSTR(by_name.as_ptr()), None, LOAD_LIBRARY_FLAGS(0)) {
+        return Some(module);
+    }
+    let marconi_root = std::env::var_os("MARCONI_ROOT")?;
+    let path = PathBuf::from(marconi_root)
+        .join("bin")
+        .join(redirect_name)
+        .as_os_str()
+        .encode_wide()
+        .chain(iter::once(0))
+        .collect::<Vec<_>>();
+    LoadLibraryExW(
+        PCWSTR(path.as_ptr()),
+        None,
+        LOAD_LIBRARY_SEARCH_DEFAULT_DIRS | LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR,
+    )
+    .ok()
+}
+
+// Taken from .NET Environment.UserInteractive
+unsafe fn is_interactive_session() -> bool {
+    let Ok(station) = GetProcessWindowStation() else {
+        return false;
+    };
+    let mut flags: USEROBJECTFLAGS = mem::zeroed();
+    let mut dummy = 0;
+    if GetUserObjectInformationW(
+        HANDLE(station.0),
+        UOI_FLAGS,
+        Some(ptr::from_mut(&mut flags).cast()),
+        mem::size_of::<USEROBJECTFLAGS>() as u32,
+        Some(&mut dummy),
+    )
+    .is_err()
+    {
+        return false;
+    }
+    return (flags.dwFlags & (WSF_VISIBLE as u32)) != 0;
+}
+
+pub unsafe fn try_load_from_self_or_hip_with_message(
+    redirect_names: &[&'static str],
+) -> Option<HMODULE> {
+    let result = redirect_names
+        .iter()
+        .copied()
+        .find_map(|redirect_name| try_load_from_self_or_hip(redirect_name));
+    if result.is_none() && is_interactive_session() {
+        let mut title = U16String::from_str("ZLUDA failed to load ");
+        title.push_str(redirect_names[0]);
+        redirect_names.iter().copied().skip(1).for_each(|name| {
+            title.push_str(" or ");
+            title.push_str(name);
+        });
+        title.push_char(0 as char);
+        let config = TASKDIALOGCONFIG {
+            cbSize: mem::size_of::<TASKDIALOGCONFIG>() as u32,
+            hwndParent: HWND(ptr::null_mut()),
+            hInstance: HINSTANCE(ptr::null_mut()),
+            dwFlags: TDF_ENABLE_HYPERLINKS,
+            dwCommonButtons: TDCBF_CLOSE_BUTTON,
+            pszWindowTitle: w!("ZLUDA error"),
+            Anonymous1: TASKDIALOGCONFIG_0 {
+                pszMainIcon: TD_ERROR_ICON,
+            },
+            pszMainInstruction: PCWSTR(title.as_ptr()),
+            pszContent: w!("<A HREF=\"https://zluda.readthedocs.io/latest/hip_sdk.html\">Click here to learn how to set up the HIP SDK</A>"),
+            cButtons: 0,
+            pButtons: ptr::null_mut(),
+            nDefaultButton: IDCLOSE.0,
+            cRadioButtons: 0,
+            pRadioButtons: ptr::null_mut(),
+            nDefaultRadioButton: 0,
+            pszVerificationText: PCWSTR::null(),
+            pszExpandedInformation: PCWSTR::null(),
+            pszExpandedControlText: PCWSTR::null(),
+            pszCollapsedControlText: PCWSTR::null(),
+            Anonymous2: TASKDIALOGCONFIG_1::default(),
+            pszFooter: PCWSTR::null(),
+            pfCallback: Some(task_dialog_callback),
+            lpCallbackData: 0,
+            cxWidth: 0,
+        };
+        TaskDialogIndirect(&config, None, None, None).ok();
+    }
+    result
+}
+
+unsafe extern "system" fn task_dialog_callback(
+    _hwnd: HWND,
+    msg: TASKDIALOG_NOTIFICATIONS,
+    _wparam: WPARAM,
+    lparam: LPARAM,
+    _lprefdata: isize,
+) -> HRESULT {
+    if msg != TDN_HYPERLINK_CLICKED {
+        return S_OK;
+    }
+    windows::Win32::UI::Shell::ShellExecuteW(
+        None,
+        w!("open"),
+        PCWSTR::from_raw(lparam.0 as *const u16),
+        None,
+        None,
+        windows::Win32::UI::WindowsAndMessaging::SW_SHOW,
+    );
+    S_OK
+}
+
+pub unsafe fn delay_load_check(
+    (redirect_name, dli_notify_expected): (&'static str, DliNotify),
+    dli_notify: u32,
+    pdli: *const DelayLoadInfo,
+) -> Option<()> {
+    if dli_notify != dli_notify_expected as u32 {
         return None;
     }
     let pdli = pdli.as_ref()?;
     let name = CStr::from_ptr(pdli.sz_dll);
-    if !name.to_str().ok()?.eq_ignore_ascii_case(redirect_name) {
-        return None;
+    let dll_name = name.to_str().ok()?;
+    if dll_name.eq_ignore_ascii_case(redirect_name) {
+        Some(())
+    } else {
+        None
     }
-    try_load_from_self_dir(redirect_name).or_else(|| try_load_from_hip_path(redirect_name))
 }
 
 pub unsafe fn try_load_from_self_dir(libname: &str) -> Option<HMODULE> {
-    let mut hm = HMODULE::default();
-    GetModuleHandleExW(
-        GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
-        PCWSTR(try_load_from_self_dir as _),
-        &mut hm,
-    )
-    .ok()?;
-    let path = get_module_path_utf16(hm);
+    let path = get_module_path_for_function(try_load_from_self_dir as *const () as usize)?;
     let mut path_buf = PathBuf::from(path);
     path_buf.pop();
     path_buf.push(libname);
@@ -372,11 +640,24 @@ pub fn get_module_path(instance_handle: *mut c_void) -> CString {
     unsafe { CString::from_vec_with_nul_unchecked(buffer) }
 }
 
-fn get_module_path_utf16(instance_handle: HMODULE) -> OsString {
+pub fn get_module_path_for_function(fn_: usize) -> Option<OsString> {
+    let mut hm = HMODULE::default();
+    unsafe {
+        GetModuleHandleExW(
+            GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+            PCWSTR(fn_ as _),
+            &mut hm,
+        )
+    }
+    .ok()?;
+    Some(get_module_path_utf16(hm))
+}
+
+pub fn get_module_path_utf16(hm: HMODULE) -> OsString {
     let mut buffer = vec![0u16; windows::Win32::Foundation::MAX_PATH as usize];
     let mut copied;
     loop {
-        copied = unsafe { GetModuleFileNameW(Some(instance_handle), &mut buffer) };
+        copied = unsafe { GetModuleFileNameW(Some(hm), &mut buffer) };
         if (copied as usize) < buffer.len() {
             break;
         } else {
@@ -385,6 +666,22 @@ fn get_module_path_utf16(instance_handle: HMODULE) -> OsString {
     }
     buffer.truncate(copied as usize);
     OsString::from_wide(&buffer)
+}
+
+pub fn kill_child_on_process_exit(child: *mut c_void) -> windows::core::Result<()> {
+    let job_handle = unsafe { windows::Win32::System::JobObjects::CreateJobObjectA(None, None) }?;
+    let mut info = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
+    info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+    unsafe {
+        SetInformationJobObject(
+            job_handle,
+            JobObjectExtendedLimitInformation,
+            &mut info as *mut _ as *mut _,
+            size_of_val(&info) as u32,
+        )
+    }?;
+    unsafe { AssignProcessToJobObject(job_handle, HANDLE(child)) }?;
+    Ok(())
 }
 
 #[cfg(test)]

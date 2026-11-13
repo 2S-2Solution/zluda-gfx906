@@ -2,6 +2,7 @@ use derive_more::Display;
 use logos::Logos;
 use ptx_parser_macros::derive_parser;
 use rustc_hash::FxHashMap;
+use std::borrow::Cow;
 use std::fmt::Debug;
 use std::num::{NonZeroU8, ParseFloatError, ParseIntError};
 use std::{iter, usize};
@@ -9,7 +10,8 @@ use winnow::ascii::dec_uint;
 use winnow::combinator::*;
 use winnow::error::{ErrMode, ErrorKind};
 use winnow::stream::Accumulate;
-use winnow::token::{any, take_till};
+use winnow::token;
+use winnow::token::take_till;
 use winnow::{
     error::{ContextError, ParserError},
     stream::{Offset, Stream, StreamIsPartial},
@@ -154,8 +156,45 @@ type PtxParser<'a, 'input> =
 fn ident<'a, 'input>(stream: &mut PtxParser<'a, 'input>) -> PResult<&'input str> {
     trace(
         "ident",
-        any.verify_map(|(t, _)| {
+        token::any.verify_map(|(t, _)| {
             if let Token::Ident(text) = t {
+                if matches!(
+                    text,
+                    "%envreg1"
+                        | "%envreg2"
+                        | "%envreg3"
+                        | "%envreg4"
+                        | "%envreg5"
+                        | "%envreg6"
+                        | "%envreg7"
+                        | "%envreg8"
+                        | "%envreg9"
+                        | "%envreg10"
+                        | "%envreg11"
+                        | "%envreg12"
+                        | "%envreg13"
+                        | "%envreg14"
+                        | "%envreg15"
+                        | "%envreg16"
+                        | "%envreg17"
+                        | "%envreg18"
+                        | "%envreg19"
+                        | "%envreg20"
+                        | "%envreg21"
+                        | "%envreg22"
+                        | "%envreg23"
+                        | "%envreg24"
+                        | "%envreg25"
+                        | "%envreg26"
+                        | "%envreg27"
+                        | "%envreg28"
+                        | "%envreg29"
+                        | "%envreg30"
+                        | "%envreg31"
+                        | "%envreg32"
+                ) {
+                    stream.state.errors.push(PtxError::UnsupportedSreg(text));
+                }
                 Some(text)
             } else if let Some(text) = t.opcode_text() {
                 Some(text)
@@ -164,13 +203,13 @@ fn ident<'a, 'input>(stream: &mut PtxParser<'a, 'input>) -> PResult<&'input str>
             }
         }),
     )
-    .parse_next(stream)
+    .parse_next(&mut stream.input)
 }
 
 fn dot_ident<'a, 'input>(stream: &mut PtxParser<'a, 'input>) -> PResult<&'input str> {
     trace(
         "dot_ident",
-        any.verify_map(|(t, _)| {
+        token::any.verify_map(|(t, _)| {
             if let Token::DotIdent(text) = t {
                 Some(text)
             } else {
@@ -184,7 +223,7 @@ fn dot_ident<'a, 'input>(stream: &mut PtxParser<'a, 'input>) -> PResult<&'input 
 fn num<'a, 'input>(stream: &mut PtxParser<'a, 'input>) -> PResult<(&'input str, u32, bool)> {
     trace(
         "num",
-        any.verify_map(|(t, _)| {
+        token::any.verify_map(|(t, _)| {
             Some(match t {
                 Token::Hex(s) => {
                     if s.ends_with('U') {
@@ -250,7 +289,7 @@ fn int_immediate<'a, 'input>(input: &mut PtxParser<'a, 'input>) -> PResult<ast::
 }
 
 fn f32<'a, 'input>(stream: &mut PtxParser<'a, 'input>) -> PResult<f32> {
-    take_error(any.verify_map(|(t, _)| match t {
+    take_error(token::any.verify_map(|(t, _)| match t {
         Token::F32Hex(f) => Some(match u32::from_str_radix(&f[2..], 16) {
             Ok(x) => Ok(f32::from_bits(x)),
             Err(err) => Err((0.0, PtxError::from(err))),
@@ -261,27 +300,39 @@ fn f32<'a, 'input>(stream: &mut PtxParser<'a, 'input>) -> PResult<f32> {
 }
 
 fn f64<'a, 'input>(stream: &mut PtxParser<'a, 'input>) -> PResult<f64> {
-    take_error(any.verify_map(|(t, _)| match t {
-        Token::F64Hex(f) => Some(match u64::from_str_radix(&f[2..], 16) {
-            Ok(x) => Ok(f64::from_bits(x)),
-            Err(err) => Err((0.0, PtxError::from(err))),
+    take_error(
+        (opt(Token::Minus), token::any).verify_map(|(neg, (t, _))| match (neg, t) {
+            (None, Token::F64Hex(f)) => Some(match u64::from_str_radix(&f[2..], 16) {
+                Ok(x) => Ok(f64::from_bits(x)),
+                Err(err) => Err((0.0, PtxError::from(err))),
+            }),
+            (neg, Token::F64(f)) => {
+                let full_number = if neg.is_some() {
+                    Cow::Owned(format!("-{f}"))
+                } else {
+                    Cow::Borrowed(f)
+                };
+
+                Some(match full_number.parse::<f64>() {
+                    Ok(x) => Ok(x),
+                    Err(err) => Err((0.0, PtxError::from(err))),
+                })
+            }
+            _ => None,
         }),
-        Token::F64(f) => Some(match f.parse::<f64>() {
-            Ok(x) => Ok(x),
-            Err(err) => Err((0.0, PtxError::from(err))),
-        }),
-        _ => None,
-    }))
+    )
     .parse_next(stream)
 }
 
-fn s32<'a, 'input>(stream: &mut PtxParser<'a, 'input>) -> PResult<i32> {
+fn s64<'a, 'input>(stream: &mut PtxParser<'a, 'input>) -> PResult<i64> {
     take_error((opt(Token::Minus), num).map(|(sign, x)| {
         let (text, radix, _) = x;
-        match i32::from_str_radix(text, radix) {
-            Ok(x) => Ok(if sign.is_some() { -x } else { x }),
-            Err(err) => Err((0, PtxError::from(err))),
-        }
+        let signed_text = if sign.is_some() {
+            Cow::Owned(format!("-{text}"))
+        } else {
+            Cow::Borrowed(text)
+        };
+        i64::from_str_radix(&signed_text, radix).map_err(|err| (0, PtxError::from(err)))
     }))
     .parse_next(stream)
 }
@@ -314,14 +365,15 @@ fn u32<'a, 'input>(stream: &mut PtxParser<'a, 'input>) -> PResult<u32> {
 fn constant<'a, 'input>(stream: &mut PtxParser<'a, 'input>) -> PResult<ast::ImmediateValue> {
     // Currently the only built-in constant is WARP_SZ
     // If new ones are added, we can change this to use a Token::Constant(&str) instead
-    any.verify_map(|(t, _)| {
-        if t == Token::WarpSz {
-            Some(ast::ImmediateValue::U64(32))
-        } else {
-            None
-        }
-    })
-    .parse_next(stream)
+    token::any
+        .verify_map(|(t, _)| {
+            if t == Token::WarpSz {
+                Some(ast::ImmediateValue::U64(32))
+            } else {
+                None
+            }
+        })
+        .parse_next(stream)
 }
 
 fn immediate_value<'a, 'input>(stream: &mut PtxParser<'a, 'input>) -> PResult<ast::ImmediateValue> {
@@ -487,19 +539,26 @@ fn module<'a, 'input>(stream: &mut PtxParser<'a, 'input>) -> PResult<ast::Module
             eof,
         )
             .map(
-                |(version, _, _, (directives, invalid_directives), _)| ast::Module {
-                    ptx_version: version,
-                    directives,
-                    invalid_directives,
+                |(version, (target, _), address_size, (directives, invalid_directives), _)| {
+                    ast::Module {
+                        ptx_version: version,
+                        sm_version: target,
+                        address_size: address_size.unwrap_or(32),
+                        directives: directives.into_iter().flatten().collect(),
+                        invalid_directives,
+                    }
                 },
             ),
     )
     .parse_next(stream)
 }
 
-fn address_size<'a, 'input>(stream: &mut PtxParser<'a, 'input>) -> PResult<()> {
-    (Token::DotAddressSize, u8_literal(64))
-        .void()
+fn address_size<'a, 'input>(stream: &mut PtxParser<'a, 'input>) -> PResult<u8> {
+    (
+        Token::DotAddressSize,
+        alt((u8_literal(64).value(64u8), u8_literal(32).value(32u8))),
+    )
+        .map(|(_, size)| size)
         .parse_next(stream)
 }
 
@@ -516,23 +575,38 @@ fn version<'a, 'input>(stream: &mut PtxParser<'a, 'input>) -> PResult<(u8, u8)> 
 }
 
 fn target<'a, 'input>(stream: &mut PtxParser<'a, 'input>) -> PResult<(u32, Option<char>)> {
-    preceded(Token::DotTarget, ident.and_then(shader_model)).parse_next(stream)
+    preceded(
+        Token::DotTarget,
+        (
+            ident.and_then(shader_model),
+            opt((Token::Comma, ident_literal("debug"))),
+        ),
+    )
+    .map(|((target, arch_variant), _debug)| (target, arch_variant))
+    .parse_next(stream)
 }
 
 fn shader_model<'a>(stream: &mut &str) -> PResult<(u32, Option<char>)> {
     (
         "sm_",
         dec_uint,
-        opt(any.verify(|c: &char| c.is_ascii_lowercase())),
+        opt(token::any.verify(|c: &char| c.is_ascii_lowercase())),
         eof,
     )
         .map(|(_, digits, arch_variant, _)| (digits, arch_variant))
         .parse_next(stream)
 }
 
+/// Parses a directive from the input stream.
+///
+/// The return type is a double-Option:
+/// - The outer `Option` indicates parse success: `None` means a parse error occurred, `Some` means parsing succeeded.
+/// - The inner `Option` indicates whether the directive should be included in the AST:
+///     - `None` means the directive should be ignored (e.g., directives like `.file` or `.section`).
+///     - `Some` contains the actual directive to include in the AST.
 fn directive<'a, 'input>(
     stream: &mut PtxParser<'a, 'input>,
-) -> PResult<Option<ast::Directive<'input, ast::ParsedOperand<&'input str>>>> {
+) -> PResult<Option<Option<ast::Directive<'input, ast::ParsedOperand<&'input str>>>>> {
     let errors = stream.state.errors.len();
     let directive = trace(
         "directive",
@@ -546,7 +620,7 @@ fn directive<'a, 'input>(
                     .map(|((linking, var), _)| Some(ast::Directive::Variable(linking, var))),
             )),
             (
-                any,
+                token::any,
                 take_till(1.., |(token, _)| match token {
             // visibility
             Token::DotExtern | Token::DotVisible | Token::DotWeak
@@ -561,8 +635,7 @@ fn directive<'a, 'input>(
             )
                 .map(|(_, x)| x),
             |text| PtxError::UnrecognizedDirective(text.unwrap_or("")),
-        )
-        .map(Option::flatten),
+        ),
     )
     .parse_next(stream)?;
     if errors != stream.state.errors.len() {
@@ -681,7 +754,7 @@ fn linking_directives<'a, 'input>(
         "linking_directives",
         repeat(
             0..,
-            dispatch! { any;
+            dispatch! { token::any;
                 (Token::DotExtern, _) => empty.value(ast::LinkingDirective::EXTERN),
                 (Token::DotVisible, _) => empty.value(ast::LinkingDirective::VISIBLE),
                 (Token::DotWeak, _) => empty.value(ast::LinkingDirective::WEAK),
@@ -696,7 +769,7 @@ fn linking_directives<'a, 'input>(
 fn tuning_directive<'a, 'input>(
     stream: &mut PtxParser<'a, 'input>,
 ) -> PResult<ast::TuningDirective> {
-    dispatch! {any;
+    dispatch! {token::any;
         (Token::DotMaxnreg, _) => u32.map(ast::TuningDirective::MaxNReg),
         (Token::DotMaxntid, _) => tuple1to3_u32.map(|(nx, ny, nz)| ast::TuningDirective::MaxNtid(nx, ny, nz)),
         (Token::DotReqntid, _) => tuple1to3_u32.map(|(nx, ny, nz)| ast::TuningDirective::ReqNtid(nx, ny, nz)),
@@ -710,7 +783,7 @@ fn tuning_directive<'a, 'input>(
 fn method_declaration<'a, 'input>(
     stream: &mut PtxParser<'a, 'input>,
 ) -> PResult<ast::MethodDeclaration<'input, &'input str>> {
-    dispatch! {any;
+    dispatch! {token::any;
         (Token::DotEntry, _) => (ident, kernel_arguments).map(|(name, input_arguments)| ast::MethodDeclaration{
             return_arguments: Vec::new(), name: ast::MethodName::Kernel(name), input_arguments, shared_mem: None
         }),
@@ -753,7 +826,7 @@ fn kernel_input<'a, 'input>(
 }
 
 fn fn_input<'a, 'input>(stream: &mut PtxParser<'a, 'input>) -> PResult<ast::Variable<&'input str>> {
-    dispatch! { any;
+    dispatch! { token::any;
         (Token::DotParam, _) => method_parameter(StateSpace::Param, false),
         (Token::DotReg, _) => method_parameter(StateSpace::Reg, false),
         _ => fail
@@ -802,7 +875,7 @@ fn tuple1to3_u32<'a, 'input>(stream: &mut PtxParser<'a, 'input>) -> PResult<(u32
 fn function_body<'a, 'input>(
     stream: &mut PtxParser<'a, 'input>,
 ) -> PResult<Option<Vec<ast::Statement<ParsedOperandStr<'input>>>>> {
-    trace("function_body", dispatch! {any;
+    trace("function_body", dispatch! {token::any;
         (Token::LBrace, _) => terminated(repeat_without_none(statement), Token::RBrace).map(Some),
         (Token::Semicolon, _) => empty.map(|_| None),
         _ => fail
@@ -930,7 +1003,8 @@ fn method_parameter<'a, 'input: 'a>(
                 ident,
             ),
         )
-        .map(|(vector, type_, _, align, name)| ((align, vector, type_), name))
+        // The alignment after .ptr is that of the data pointed to, not of the parameter.
+        .map(|(vector, type_, _, _, name)| ((None, vector, type_), name))
         .parse_next(stream)
     }
     trace(
@@ -938,7 +1012,8 @@ fn method_parameter<'a, 'input: 'a>(
         move |stream: &mut PtxParser<'a, 'input>| {
             if kernel_decl_rules {}
             let ((align, vector, type_), name) =
-                alt(((variable_info, ident), nvptx_kernel_declaration)).parse_next(stream)?;
+                alt(((variable_info_non_texref, ident), nvptx_kernel_declaration))
+                    .parse_next(stream)?;
             let array_dimensions = if state_space != StateSpace::Reg {
                 opt(array_dimensions).parse_next(stream)?
             } else {
@@ -963,12 +1038,70 @@ fn method_parameter<'a, 'input: 'a>(
     )
 }
 
+enum ParsedType {
+    Texref,
+    Surfref,
+    Type {
+        align: Option<u32>,
+        vector: Option<NonZeroU8>,
+        scalar: ScalarType,
+    },
+}
+
+fn texref_or_surfref<'a, 'input>(stream: &mut PtxParser<'a, 'input>) -> PResult<ParsedType> {
+    trace(
+        "texref_or_surfref",
+        alt((
+            Token::DotTexref.map(|_| ParsedType::Texref),
+            Token::DotSurfref.map(|_| ParsedType::Surfref),
+        )),
+    )
+    .parse_next(stream)
+}
+
+fn parse_if<Input, Output, Error, ParseNext>(
+    cond: bool,
+    mut parser: ParseNext,
+) -> impl Parser<Input, Output, Error>
+where
+    Input: Stream,
+    ParseNext: Parser<Input, Output, Error>,
+    Error: ParserError<Input>,
+{
+    trace("cond_fail", move |input: &mut Input| {
+        if cond {
+            parser.parse_next(input)
+        } else {
+            fail(input)
+        }
+    })
+}
+
+fn variable_info<'a, 'input: 'a>(
+    state_space: StateSpace,
+) -> impl Parser<PtxParser<'a, 'input>, ParsedType, ContextError> {
+    trace(
+        "variable_info",
+        move |stream: &mut PtxParser<'a, 'input>| {
+            alt((
+                parse_if(state_space == StateSpace::Global, texref_or_surfref),
+                variable_info_non_texref.map(|(align, vector, scalar)| ParsedType::Type {
+                    align,
+                    vector,
+                    scalar,
+                }),
+            ))
+            .parse_next(stream)
+        },
+    )
+}
+
 // TODO: split to a separate type
-fn variable_info<'a, 'input>(
+fn variable_info_non_texref<'a, 'input>(
     stream: &mut PtxParser<'a, 'input>,
 ) -> PResult<(Option<u32>, Option<NonZeroU8>, ScalarType)> {
     trace(
-        "variable_info",
+        "variable_info_non_texref",
         (
             opt(align.verify(|x| x.count_ones() == 1)),
             vector_prefix,
@@ -985,13 +1118,48 @@ fn multi_variable<'a, 'input: 'a>(
     trace(
         "multi_variable",
         move |stream: &mut PtxParser<'a, 'input>| {
-            let ((align, vector, type_), names, count): (_, Vec<_>, _) = (
-                variable_info,
+            let (parsed_type, names, count): (_, Vec<_>, _) = (
+                variable_info(state_space),
                 separated(1.., ident, Token::Comma),
                 // https://docs.nvidia.com/cuda/parallel-thread-execution/index.html#parameterized-variable-names
                 opt(delimited(Token::Lt, u32.verify(|x| *x != 0), Token::Gt)),
             )
                 .parse_next(stream)?;
+            let (align, vector, type_) = match parsed_type {
+                ParsedType::Texref => {
+                    if count.is_some() {
+                        return Err(ErrMode::from_error_kind(stream, ErrorKind::Verify));
+                    }
+                    return Ok(MultiVariable::Names {
+                        info: VariableInfo {
+                            align: None,
+                            v_type: Type::Texref,
+                            state_space,
+                            array_init: Vec::new(),
+                        },
+                        names,
+                    });
+                }
+                ParsedType::Surfref => {
+                    if count.is_some() {
+                        return Err(ErrMode::from_error_kind(stream, ErrorKind::Verify));
+                    }
+                    return Ok(MultiVariable::Names {
+                        info: VariableInfo {
+                            align: None,
+                            v_type: Type::Surfref,
+                            state_space,
+                            array_init: Vec::new(),
+                        },
+                        names,
+                    });
+                }
+                ParsedType::Type {
+                    align,
+                    vector,
+                    scalar,
+                } => (align, vector, scalar),
+            };
             if let Some(count) = count {
                 if names.len() > 1 {
                     // nvcc does not support parameterized variable names in comma-separated lists of names.
@@ -1009,19 +1177,19 @@ fn multi_variable<'a, 'input: 'a>(
                     count,
                 });
             }
-            let mut array_dimensions = if state_space != StateSpace::Reg {
+            let array_dimensions = if state_space != StateSpace::Reg {
                 opt(array_dimensions).parse_next(stream)?
             } else {
                 None
             };
             let initializer = match state_space {
                 StateSpace::Global | StateSpace::Const => match array_dimensions {
-                    Some(ref mut dimensions) => {
-                        opt(array_initializer(type_, vector, dimensions)).parse_next(stream)?
+                    Some(ref dimensions) => {
+                        array_initializer(type_, vector, dimensions).parse_next(stream)?
                     }
-                    None => opt(value_initializer(vector)).parse_next(stream)?,
+                    None => value_initializer(type_, vector).parse_next(stream)?,
                 },
-                _ => None,
+                _ => Vec::new(),
             };
             if let Some(ref dims) = array_dimensions {
                 if !extern_ && dims[0] == 0 {
@@ -1033,7 +1201,7 @@ fn multi_variable<'a, 'input: 'a>(
                     align,
                     v_type: Type::maybe_array(vector, type_, array_dimensions),
                     state_space,
-                    array_init: initializer.unwrap_or(Vec::new()),
+                    array_init: initializer,
                 },
                 names,
             })
@@ -1044,11 +1212,20 @@ fn multi_variable<'a, 'input: 'a>(
 fn array_initializer<'b, 'a: 'b, 'input: 'a>(
     type_: ScalarType,
     vector: Option<NonZeroU8>,
-    array_dimensions: &'b mut Vec<u32>,
+    array_dimensions: &'b Vec<u32>,
 ) -> impl Parser<PtxParser<'a, 'input>, Vec<RegOrImmediate<&'input str>>, ContextError> + 'b {
+    let pad_with_zeros = move |result: Option<Vec<RegOrImmediate<&'input str>>>| {
+        let mut result = result.unwrap_or(Vec::new());
+        let result_size = array_dimensions[0] as usize;
+        let default = default_immediate_from_type(type_);
+        result.extend(
+            iter::repeat(ast::RegOrImmediate::Imm(default)).take(result_size - result.len()),
+        );
+        result
+    };
     trace(
         "array_initializer",
-        move |stream: &mut PtxParser<'a, 'input>| {
+        opt(move |stream: &mut PtxParser<'a, 'input>| {
             Token::Eq.parse_next(stream)?;
             let mut result = Vec::new();
             // TODO: vector constants and multi dim arrays
@@ -1065,29 +1242,27 @@ fn array_initializer<'b, 'a: 'b, 'input: 'a>(
                 Token::RBrace,
             )
             .parse_next(stream)?;
-            // pad with zeros
-            let result_size = array_dimensions[0] as usize;
-            let default = match type_.kind() {
-                ScalarKind::Bit | ScalarKind::Unsigned | ScalarKind::Pred => {
-                    ast::ImmediateValue::U64(0)
-                }
-                ScalarKind::Signed => ast::ImmediateValue::S64(0),
-                ScalarKind::Float => ast::ImmediateValue::F64(0.0),
-            };
-            result.extend(
-                iter::repeat(ast::RegOrImmediate::Imm(default)).take(result_size - result.len()),
-            );
             Ok(result)
-        },
+        })
+        .map(pad_with_zeros),
     )
 }
 
+fn default_immediate_from_type(type_: ScalarType) -> ast::ImmediateValue {
+    match type_.kind() {
+        ScalarKind::Bit | ScalarKind::Unsigned | ScalarKind::Pred => ast::ImmediateValue::U64(0),
+        ScalarKind::Signed => ast::ImmediateValue::S64(0),
+        ScalarKind::Float => ast::ImmediateValue::F64(0.0),
+    }
+}
+
 fn value_initializer<'a, 'input: 'a>(
+    type_: ScalarType,
     vector: Option<NonZeroU8>,
 ) -> impl Parser<PtxParser<'a, 'input>, Vec<RegOrImmediate<&'input str>>, ContextError> {
     trace(
         "value_initializer",
-        move |stream: &mut PtxParser<'a, 'input>| {
+        opt(move |stream: &mut PtxParser<'a, 'input>| {
             Token::Eq.parse_next(stream)?;
             let mut result = Vec::new();
             // TODO: vector constants
@@ -1096,7 +1271,12 @@ fn value_initializer<'a, 'input: 'a>(
             }
             single_value_append(&mut result).parse_next(stream)?;
             Ok(result)
-        },
+        })
+        .map(move |maybe_vec| {
+            maybe_vec.unwrap_or_else(|| {
+                vec![ast::RegOrImmediate::Imm(default_immediate_from_type(type_))]
+            })
+        }),
     )
 }
 
@@ -1204,34 +1384,35 @@ fn vector_prefix<'a, 'input>(stream: &mut PtxParser<'a, 'input>) -> PResult<Opti
 }
 
 fn scalar_type<'a, 'input>(stream: &mut PtxParser<'a, 'input>) -> PResult<ScalarType> {
-    any.verify_map(|(t, _)| {
-        Some(match t {
-            Token::DotS8 => ScalarType::S8,
-            Token::DotS16 => ScalarType::S16,
-            Token::DotS16x2 => ScalarType::S16x2,
-            Token::DotS32 => ScalarType::S32,
-            Token::DotS64 => ScalarType::S64,
-            Token::DotU8 => ScalarType::U8,
-            Token::DotU16 => ScalarType::U16,
-            Token::DotU16x2 => ScalarType::U16x2,
-            Token::DotU32 => ScalarType::U32,
-            Token::DotU64 => ScalarType::U64,
-            Token::DotB8 => ScalarType::B8,
-            Token::DotB16 => ScalarType::B16,
-            Token::DotB32 => ScalarType::B32,
-            Token::DotB64 => ScalarType::B64,
-            Token::DotB128 => ScalarType::B128,
-            Token::DotPred => ScalarType::Pred,
-            Token::DotF16 => ScalarType::F16,
-            Token::DotF16x2 => ScalarType::F16x2,
-            Token::DotF32 => ScalarType::F32,
-            Token::DotF64 => ScalarType::F64,
-            Token::DotBF16 => ScalarType::BF16,
-            Token::DotBF16x2 => ScalarType::BF16x2,
-            _ => return None,
+    token::any
+        .verify_map(|(t, _)| {
+            Some(match t {
+                Token::DotS8 => ScalarType::S8,
+                Token::DotS16 => ScalarType::S16,
+                Token::DotS16x2 => ScalarType::S16x2,
+                Token::DotS32 => ScalarType::S32,
+                Token::DotS64 => ScalarType::S64,
+                Token::DotU8 => ScalarType::U8,
+                Token::DotU16 => ScalarType::U16,
+                Token::DotU16x2 => ScalarType::U16x2,
+                Token::DotU32 => ScalarType::U32,
+                Token::DotU64 => ScalarType::U64,
+                Token::DotB8 => ScalarType::B8,
+                Token::DotB16 => ScalarType::B16,
+                Token::DotB32 => ScalarType::B32,
+                Token::DotB64 => ScalarType::B64,
+                Token::DotB128 => ScalarType::B128,
+                Token::DotPred => ScalarType::Pred,
+                Token::DotF16 => ScalarType::F16,
+                Token::DotF16x2 => ScalarType::F16x2,
+                Token::DotF32 => ScalarType::F32,
+                Token::DotF64 => ScalarType::F64,
+                Token::DotBF16 => ScalarType::BF16,
+                Token::DotBF16x2 => ScalarType::BF16x2,
+                _ => return None,
+            })
         })
-    })
-    .parse_next(stream)
+        .parse_next(stream)
 }
 
 fn predicated_instruction<'a, 'input>(
@@ -1274,7 +1455,7 @@ fn debug_directive<'a, 'input>(stream: &mut PtxParser<'a, 'input>) -> PResult<()
             Token::Comma,
             ident_literal("function_name"),
             ident,
-            dispatch! { any;
+            dispatch! { token::any;
                 (Token::Comma, _) => (ident_literal("inlined_at"), u32, u32, u32).void(),
                 (Token::Plus, _) => (u32, Token::Comma, ident_literal("inlined_at"), u32, u32, u32).void(),
                 _ => fail
@@ -1339,7 +1520,8 @@ fn ident_literal<
     s: &'input str,
 ) -> impl Parser<I, (), E> + 'input {
     move |stream: &mut I| {
-        any.verify(|(t, _)| matches!(t, Token::Ident(text) if *text == s))
+        token::any
+            .verify(|(t, _)| matches!(t, Token::Ident(text) if *text == s))
             .void()
             .parse_next(stream)
     }
@@ -1368,7 +1550,7 @@ impl<Ident> ast::ParsedOperand<Ident> {
         ) -> PResult<ast::ParsedOperand<&'input str>> {
             let main_ident = ident.parse_next(stream)?;
             alt((
-                preceded(Token::Plus, s32)
+                preceded(Token::Plus, s64)
                     .map(move |offset| ast::ParsedOperand::RegOffset(main_ident, offset)),
                 take_error(dot_ident.map(move |suffix| {
                     let vector_index = vector_index(suffix)
@@ -1381,10 +1563,14 @@ impl<Ident> ast::ParsedOperand<Ident> {
         }
         fn vector_operand<'a, 'input>(
             stream: &mut PtxParser<'a, 'input>,
-        ) -> PResult<Vec<ast::RegOrImmediate<&'input str>>> {
+        ) -> PResult<Vec<Option<ast::RegOrImmediate<&'input str>>>> {
             delimited(
                 Token::LBrace,
-                separated(1..=8, reg_or_immediate, Token::Comma),
+                separated(
+                    1..=8,
+                    alt((Token::Sink.value(None), reg_or_immediate.map(Some))),
+                    Token::Comma,
+                ),
                 Token::RBrace,
             )
             .parse_next(stream)
@@ -1453,6 +1639,8 @@ pub enum PtxError<'input> {
     UnrecognizedStatement(&'input str),
     #[error("Unrecognized directive {0:?}")]
     UnrecognizedDirective(&'input str),
+    #[error("Unsupported special register {0:?}")]
+    UnsupportedSreg(&'input str),
 }
 
 #[derive(Debug)]
@@ -1551,7 +1739,7 @@ impl<'input, X, I: Stream<Token = (Self, X)> + StreamIsPartial, E: ParserError<I
     Parser<I, (Self, X), E> for Token<'input>
 {
     fn parse_next(&mut self, input: &mut I) -> PResult<(Self, X), E> {
-        any.verify(|(t, _)| t == self).parse_next(input)
+        token::any.verify(|(t, _)| t == self).parse_next(input)
     }
 }
 
@@ -1560,7 +1748,7 @@ fn bra<'a, 'input>(
 ) -> PResult<ast::Instruction<ParsedOperandStr<'input>>> {
     preceded(
         opt(Token::DotUni),
-        any.verify_map(|(t, _)| match t {
+        token::any.verify_map(|(t, _)| match t {
             Token::Ident(ident) => Some(ast::Instruction::Bra {
                 arguments: BraArgs { src: ident },
             }),
@@ -1625,37 +1813,6 @@ fn call<'a, 'input>(
     Ok(ast::Instruction::Call { data, arguments })
 }
 
-// VEGA 3 lug: parser custom per la scalar video instruction `vshr.u32.u32.u32.clamp.add d,a,b,c`
-// (unica forma emessa da cub radix sort → torch.sort/argsort/topk/randperm). Semantica PTX:
-// d = (a >> min(b,32)) + c, u32 logico. Il macro derive_parser vuole i modificatori-enum prima del
-// tipo, ma qui e' tipo-poi-enum, quindi parser a mano. Matcha SOLO questa forma: ogni altra fa
-// fallire il parser (statement non riconosciuto) invece di dare risultati sbagliati (Regola 3).
-fn vshr<'a, 'input>(
-    stream: &mut PtxParser<'a, 'input>,
-) -> PResult<ast::Instruction<ParsedOperandStr<'input>>> {
-    Token::DotU32.parse_next(stream)?; // dtype
-    Token::DotU32.parse_next(stream)?; // atype (valore da shiftare)
-    Token::DotU32.parse_next(stream)?; // btype (ampiezza shift)
-    Token::DotClamp.parse_next(stream)?;
-    Token::DotAdd.parse_next(stream)?;
-    let d = ParsedOperand::<&'input str>::parse.parse_next(stream)?;
-    Token::Comma.parse_next(stream)?;
-    let a = ParsedOperand::<&'input str>::parse.parse_next(stream)?;
-    Token::Comma.parse_next(stream)?;
-    let b = ParsedOperand::<&'input str>::parse.parse_next(stream)?;
-    Token::Comma.parse_next(stream)?;
-    let c = ParsedOperand::<&'input str>::parse.parse_next(stream)?;
-    Ok(ast::Instruction::Vshr {
-        data: ScalarType::U32,
-        arguments: VshrArgs {
-            dst: d,
-            src1: a,
-            src2: b,
-            src3: c,
-        },
-    })
-}
-
 fn empty_call<'input>(
     uniform: bool,
     name: &'input str,
@@ -1673,6 +1830,42 @@ fn empty_call<'input>(
             is_external: false,
         },
     }
+}
+
+fn vshr<'a, 'input>(
+    stream: &mut PtxParser<'a, 'input>,
+    ctor: impl FnOnce(
+        FunnelShiftMode,
+        VshOp,
+        ParsedOperandStr<'input>,
+        ParsedOperandStr<'input>,
+        ParsedOperandStr<'input>,
+        ParsedOperandStr<'input>,
+    ) -> ast::Instruction<ParsedOperandStr<'input>>,
+) -> PResult<ast::Instruction<ParsedOperandStr<'input>>> {
+    // vshr.u32.u32.u32.mode.op2 d, a, b, c
+    let ((), (), (), mode, op2, d, (), a, (), b, (), c) = trace(
+        "vshr",
+        (
+            Token::DotU32.void(),
+            Token::DotU32.void(),
+            Token::DotU32.void(),
+            alt((
+                Token::DotClamp.map(|_| FunnelShiftMode::Clamp),
+                Token::DotWrap.map(|_| FunnelShiftMode::Wrap),
+            )),
+            Token::DotAdd.map(|_| VshOp::Add),
+            ParsedOperandStr::parse,
+            Token::Comma.void(),
+            ParsedOperandStr::parse,
+            Token::Comma.void(),
+            ParsedOperandStr::parse,
+            Token::Comma.void(),
+            ParsedOperandStr::parse,
+        ),
+    )
+    .parse_next(stream)?;
+    Ok(ctor(mode, op2, d, a, b, c))
 }
 
 type ParsedOperandStr<'input> = ast::ParsedOperand<&'input str>;
@@ -1801,6 +1994,8 @@ derive_parser!(
         At,
         #[regex(r"[a-zA-Z][a-zA-Z0-9_$]*|[_$%][a-zA-Z0-9_$]+", |lex| lex.slice(), priority = 0)]
         Ident(&'input str),
+        #[token("_")]
+        Sink,
         #[regex(r"\.[a-zA-Z][a-zA-Z0-9_$]*|\.[_$%][a-zA-Z0-9_$]+", |lex| lex.slice(), priority = 0)]
         DotIdent(&'input str),
         #[regex(r#""[^"]*""#)]
@@ -1880,7 +2075,11 @@ derive_parser!(
         #[token(".ptr")]
         DotPtr,
         #[token(".noreturn")]
-        DotNoreturn
+        DotNoreturn,
+        #[token(".texref")]
+        DotTexref,
+        #[token(".surfref")]
+        DotSurfref
     }
 
     #[derive(Copy, Clone, Display, PartialEq, Eq, Hash)]
@@ -1937,6 +2136,11 @@ derive_parser!(
 
     #[derive(Copy, Clone, Display, PartialEq, Eq, Hash)]
     pub enum EvictionPriority { }
+
+    #[derive(Copy, Clone, Display, PartialEq, Eq, Hash)]
+    pub enum VshOp {
+        Add
+    }
 
     // https://docs.nvidia.com/cuda/parallel-thread-execution/index.html#data-movement-and-conversion-instructions-mov
     mov{.vec}.type  d, a => {
@@ -2188,51 +2392,6 @@ derive_parser!(
                           .u16x2, .s16x2 };
     ScalarType =        { .s32 };
 
-    // VEGA 3 lug: extended-precision add/sub con riporto (CC.CF implicito).
-    // https://docs.nvidia.com/cuda/parallel-thread-execution/#extended-precision-integer-arithmetic-instructions
-    add.cc.type     d, a, b => {
-        ast::Instruction::AddCarry {
-            data: ast::AddCarryDetails { type_, subtract: false, carry_in: false, carry_out: true },
-            arguments: AddCarryArgs { dst: d, src1: a, src2: b }
-        }
-    }
-    .type: ScalarType = { .u32, .s32 };
-    addc.cc.type    d, a, b => {
-        ast::Instruction::AddCarry {
-            data: ast::AddCarryDetails { type_, subtract: false, carry_in: true, carry_out: true },
-            arguments: AddCarryArgs { dst: d, src1: a, src2: b }
-        }
-    }
-    .type: ScalarType = { .u32, .s32 };
-    addc.type       d, a, b => {
-        ast::Instruction::AddCarry {
-            data: ast::AddCarryDetails { type_, subtract: false, carry_in: true, carry_out: false },
-            arguments: AddCarryArgs { dst: d, src1: a, src2: b }
-        }
-    }
-    .type: ScalarType = { .u32, .s32 };
-    sub.cc.type     d, a, b => {
-        ast::Instruction::AddCarry {
-            data: ast::AddCarryDetails { type_, subtract: true, carry_in: false, carry_out: true },
-            arguments: AddCarryArgs { dst: d, src1: a, src2: b }
-        }
-    }
-    .type: ScalarType = { .u32, .s32 };
-    subc.cc.type    d, a, b => {
-        ast::Instruction::AddCarry {
-            data: ast::AddCarryDetails { type_, subtract: true, carry_in: true, carry_out: true },
-            arguments: AddCarryArgs { dst: d, src1: a, src2: b }
-        }
-    }
-    .type: ScalarType = { .u32, .s32 };
-    subc.type       d, a, b => {
-        ast::Instruction::AddCarry {
-            data: ast::AddCarryDetails { type_, subtract: true, carry_in: true, carry_out: false },
-            arguments: AddCarryArgs { dst: d, src1: a, src2: b }
-        }
-    }
-    .type: ScalarType = { .u32, .s32 };
-
     // https://docs.nvidia.com/cuda/parallel-thread-execution/#floating-point-instructions-add
     add{.rnd}{.ftz}{.sat}.f32  d, a, b => {
         Instruction::Add {
@@ -2469,11 +2628,11 @@ derive_parser!(
         }
     }
 
-    set.CmpOp{.ftz}.u32.f16x2         d, a, b => {
+    set.CmpOp{.ftz}.dtype_f16x2.f16x2         d, a, b => {
         let base = ast::SetpData::try_parse(state, cmpop, ftz, ScalarType::F16x2);
         let data = ast::SetData {
             base,
-            dtype: ScalarType::U32
+            dtype: dtype_f16x2
         };
         ast::Instruction::Set {
             data,
@@ -2503,6 +2662,7 @@ derive_parser!(
                                   .equ, .neu, .ltu, .leu, .gtu, .geu, .num, .nan }; // float-only
     .BoolOp: SetpBoolPostOp = { .and, .or, .xor };
     .dtype: ScalarType = { .u32, .s32, .f32 };
+    .dtype_f16x2: ScalarType = { .u32, .f16x2 };
     .stype: ScalarType = { .b16, .b32, .b64, .u16, .u32, .u64, .s16, .s32, .s64, .f16, .f32, .f64 };
 
 
@@ -2661,12 +2821,15 @@ derive_parser!(
 
     // https://docs.nvidia.com/cuda/parallel-thread-execution/index.html#data-movement-and-conversion-instructions-cvta
     cvta.space.size     p, a => {
-        if size != ScalarType::U64 {
-            state.errors.push(PtxError::Unsupported32Bit);
-        }
+        let size = match size {
+            ScalarType::U32 => 32,
+            ScalarType::U64 => 64,
+            _ => unreachable!()
+        };
         let data = ast::CvtaDetails {
             state_space: space,
-            direction: ast::CvtaDirection::ExplicitToGeneric
+            direction: ast::CvtaDirection::ExplicitToGeneric,
+            size,
         };
         let arguments = ast::CvtaArgs {
             dst: p, src: a
@@ -2676,12 +2839,15 @@ derive_parser!(
         }
     }
     cvta.to.space.size  p, a => {
-        if size != ScalarType::U64 {
-            state.errors.push(PtxError::Unsupported32Bit);
-        }
+        let size = match size {
+            ScalarType::U32 => 32,
+            ScalarType::U64 => 64,
+            _ => unreachable!()
+        };
         let data = ast::CvtaDetails {
             state_space: space,
-            direction: ast::CvtaDirection::GenericToExplicit
+            direction: ast::CvtaDirection::GenericToExplicit,
+            size,
         };
         let arguments = ast::CvtaArgs {
             dst: p, src: a
@@ -2819,39 +2985,6 @@ derive_parser!(
     }
     RawMulIntControl =  { .hi };
     ScalarType =        { .s32 };
-
-    // VEGA 3 lug: mul-add con riporto (extended-precision). mad.lo.cc/mad.hi.cc/
-    // madc.lo.cc/madc.hi.cc/madc.lo/madc.hi — 6 forme in 3 regole via .mode.
-    mad.mode.cc.type   d, a, b, c => {
-        ast::Instruction::MadCarry {
-            data: ast::MadCarryDetails {
-                type_, hi: matches!(mode, RawMulIntControl::Hi), carry_in: false, carry_out: true
-            },
-            arguments: MadCarryArgs { dst: d, src1: a, src2: b, src3: c }
-        }
-    }
-    .mode: RawMulIntControl = { .hi, .lo };
-    .type: ScalarType = { .u32, .s32 };
-    madc.mode.cc.type  d, a, b, c => {
-        ast::Instruction::MadCarry {
-            data: ast::MadCarryDetails {
-                type_, hi: matches!(mode, RawMulIntControl::Hi), carry_in: true, carry_out: true
-            },
-            arguments: MadCarryArgs { dst: d, src1: a, src2: b, src3: c }
-        }
-    }
-    .mode: RawMulIntControl = { .hi, .lo };
-    .type: ScalarType = { .u32, .s32 };
-    madc.mode.type     d, a, b, c => {
-        ast::Instruction::MadCarry {
-            data: ast::MadCarryDetails {
-                type_, hi: matches!(mode, RawMulIntControl::Hi), carry_in: true, carry_out: false
-            },
-            arguments: MadCarryArgs { dst: d, src1: a, src2: b, src3: c }
-        }
-    }
-    .mode: RawMulIntControl = { .hi, .lo };
-    .type: ScalarType = { .u32, .s32 };
 
     mad{.ftz}{.sat}.f32      d, a, b, c => {
         ast::Instruction::Mad {
@@ -3845,6 +3978,15 @@ derive_parser!(
     }
     .type: ScalarType = { .b32, .b64 };
 
+    // https://docs.nvidia.com/cuda/parallel-thread-execution/index.html#integer-arithmetic-instructions-bmsk
+    bmsk.mode.b32  d, a, b => {
+        ast::Instruction::Bmsk {
+            data: mode,
+            arguments: BmskArgs { dst: d, src_a: a, src_b: b },
+        }
+    }
+    .mode: BmskMode = { .clamp };
+
     // https://docs.nvidia.com/cuda/parallel-thread-execution/index.html#data-movement-and-conversion-instructions-prmt
     // prmt.b32{.mode}  d, a, b, c;
     // .mode = { .f4e, .b4e, .rc8, .ecl, .ecr, .rc16 };
@@ -3903,10 +4045,16 @@ derive_parser!(
     .type: ScalarType = { .u32, .s32 };
 
     // https://docs.nvidia.com/cuda/parallel-thread-execution/#data-movement-and-conversion-instructions-shfl-sync
+    shfl.mode.b32  d[|p], a, b, c => {
+        Instruction::Shfl  {
+            data: ast::ShflDetails { mode },
+            arguments: ShflArgs { dst: d, dst_pred: p, src: a, src_lane: b, src_opts: c, src_membermask: None }
+        }
+    }
     shfl.sync.mode.b32  d[|p], a, b, c, membermask => {
-        Instruction::ShflSync  {
-            data: ast::ShflSyncDetails { mode },
-            arguments: ShflSyncArgs { dst: d, dst_pred: p, src: a, src_lane: b, src_opts: c, src_membermask: membermask }
+        Instruction::Shfl  {
+            data: ast::ShflDetails { mode },
+            arguments: ShflArgs { dst: d, dst_pred: p, src: a, src_lane: b, src_opts: c, src_membermask: Some(membermask) }
         }
     }
     .mode: ShuffleMode = { .up, .down, .bfly, .idx };
@@ -3926,14 +4074,15 @@ derive_parser!(
             arguments: TanhArgs { dst: d, src: a }
         }
     }
-    .type: ScalarType = { .f32, .f16, .f16x2, .bf16, .bf16x2 };
+    .type: ScalarType = { .f32, .f16 };
 
     // https://docs.nvidia.com/cuda/parallel-thread-execution/#data-movement-and-conversion-instructions-cp-async
     cp.async.cop.space.global{.level::cache_hint}{.level::prefetch_size}
                              [dst], [src], cp-size{, src-size}{, cache-policy} => {
-        if level_cache_hint || cache_policy.is_some() || level_prefetch_size.is_some() {
-            state.errors.push(PtxError::Todo("cp.async instruction with cache policy/cache hints/prefetch size".to_string()));
-        }
+        // TODO: handle cache hints and cache policies
+        let _ = level_cache_hint;
+        let _ = level_prefetch_size;
+        let _ = cache_policy;
 
         let cp_size = cp_size
             .as_immediate()
@@ -3999,18 +4148,12 @@ derive_parser!(
     .dir: ShiftDirection = { .l, .r };
     .mode: FunnelShiftMode = { .clamp, .wrap };
 
-    // https://docs.nvidia.com/cuda/parallel-thread-execution/#scalar-video-instructions
-    // VEGA 3 lug: scalar video vshr (cub radix sort → torch.sort/argsort/topk/randperm). Il macro
-    // derive_parser vuole i modificatori-enum PRIMA del tipo (vedi shf/atom), ma la forma reale e'
-    // tipo-poi-enum (.u32.u32.u32.clamp.add) → parser CUSTOM via escape `<=` (come bra/call).
-    vshr <= { vshr(stream) }
-
     trap => {
         Instruction::Trap {}
     }
 
     // https://docs.nvidia.com/cuda/parallel-thread-execution/#control-flow-instructions-exit
-    // VEGA 3 lug: `exit` termina il thread (cub radix sort SingleTile → torch.randperm).
+
     exit => {
         Instruction::Exit {}
     }
@@ -4032,7 +4175,10 @@ derive_parser!(
 
     // https://docs.nvidia.com/cuda/parallel-thread-execution/#parallel-synchronization-and-communication-instructions-vote-sync
 
-    vote.sync.mode.pred  d, {!}a, membermask => {
+    vote{.sync}.mode.pred  d, {!}a{, membermask} => {
+        if sync != membermask.is_some() {
+            state.errors.push(PtxError::SyntaxError("vote instruction with inconsistent sync and membermask".to_string()));
+        }
         let (negate, a) = a;
         Instruction::Vote {
             data: VoteDetails {
@@ -4042,6 +4188,16 @@ derive_parser!(
             arguments: VoteArgs { dst: d, src1: a, src2: membermask }
         }
     }
+    vote.ballot.b32 d, {!}a => {
+        let (negate, a) = a;
+        Instruction::Vote {
+            data: VoteDetails {
+                mode: VoteMode::Ballot,
+                negate
+            },
+            arguments: VoteArgs { dst: d, src1: a, src2: None }
+        }
+    }
     vote.sync.ballot.b32 d, {!}a, membermask => {
         let (negate, a) = a;
         Instruction::Vote {
@@ -4049,7 +4205,7 @@ derive_parser!(
                 mode: VoteMode::Ballot,
                 negate
             },
-            arguments: VoteArgs { dst: d, src1: a, src2: membermask }
+            arguments: VoteArgs { dst: d, src1: a, src2: Some(membermask) }
         }
     }
 
@@ -4190,12 +4346,270 @@ derive_parser!(
     .level::primary_priority: EvictionPriority =   { .L2::evict_last, .L2::evict_normal,
                                 .L2::evict_first, .L2::evict_unchanged };
     // .level::secondary_priority: EvictionPriority = { .L2::evict_first, .L2::evict_unchanged };
+
+    sad.type  d, a, b, c => {
+        Instruction::Sad {
+            data: type_,
+            arguments: SadArgs { dst: d, src1: a, src2: b, src3: c }
+        }
+    }
+
+    .type: ScalarType = { .u16, .u32, .u64, .s16, .s32, .s64 };
+
+    dp2a.mode.atype.btype  d, a, b, c => {
+        Instruction::Dp2a {
+            data: Dp2aData {
+                atype: atype,
+                btype: btype,
+                control: match mode {
+                    RawDp2aControl::Lo => Dp2aControl::Low,
+                    RawDp2aControl::Hi => Dp2aControl::High
+                },
+            },
+            arguments: Dp2aArgs { dst: d, src1: a, src2: b, src3: c }
+        }
+    }
+
+    .atype: ScalarType = { .u32, .s32 };
+    .btype: ScalarType = { .u32, .s32 };
+    .mode: RawDp2aControl = { .lo, .hi };
+
+    // https://docs.nvidia.com/cuda/parallel-thread-execution/#extended-precision-arithmetic-instructions-add-cc
+    add.cc.type  d, a, b => {
+        Instruction::AddExtended {
+            data: CarryDetails { kind: CarryKind::CarryOut, type_: type_ },
+            arguments: AddExtendedArgs {
+                dst: d,
+                src1: a,
+                src2: b,
+            }
+        }
+    }
+
+    .type: ScalarType = { .u32, .s32, .u64, .s64 };
+
+    // https://docs.nvidia.com/cuda/parallel-thread-execution/#extended-precision-arithmetic-instructions-addc
+    addc{.cc}.type  d, a, b => {
+        Instruction::AddExtended {
+            data: CarryDetails { kind: if cc { CarryKind::CarryInCarryOut } else { CarryKind::CarryIn }, type_: type_ },
+            arguments: AddExtendedArgs {
+                dst: d,
+                src1: a,
+                src2: b,
+            }
+        }
+    }
+
+    .type: ScalarType = { .u32, .s32, .u64, .s64 };
+
+    // https://docs.nvidia.com/cuda/parallel-thread-execution/#extended-precision-arithmetic-instructions-sub-cc
+    sub.cc.type  d, a, b => {
+        Instruction::SubExtended {
+            data: CarryDetails { kind: CarryKind::CarryOut, type_: type_ },
+            arguments: SubExtendedArgs {
+                dst: d,
+                src1: a,
+                src2: b,
+            }
+        }
+    }
+
+    .type: ScalarType = { .u32, .s32, .u64, .s64 };
+
+    // https://docs.nvidia.com/cuda/parallel-thread-execution/#extended-precision-arithmetic-instructions-subc
+    subc{.cc}.type  d, a, b => {
+        Instruction::SubExtended {
+            data: CarryDetails { kind: if cc { CarryKind::CarryInCarryOut } else { CarryKind::CarryIn }, type_: type_ },
+            arguments: SubExtendedArgs {
+                dst: d,
+                src1: a,
+                src2: b,
+            }
+        }
+    }
+
+    .type: ScalarType = { .u32, .s32, .u64, .s64 };
+
+    // https://docs.nvidia.com/cuda/parallel-thread-execution/#extended-precision-arithmetic-instructions-mad-cc
+    mad.mode.cc.type  d, a, b, c => {
+        Instruction::MadExtended {
+            data: MadCarryDetails { kind: CarryKind::CarryOut, control: mode.into(), type_: type_ },
+            arguments: MadExtendedArgs { dst: d, src1: a, src2: b, src3: c }
+        }
+    }
+
+    .mode: RawMulIntControl = { .lo, .hi };
+    .type: ScalarType = { .u32, .s32, .u64, .s64 };
+
+    // https://docs.nvidia.com/cuda/parallel-thread-execution/#extended-precision-arithmetic-instructions-madc
+    madc.mode{.cc}.type  d, a, b, c => {
+        Instruction::MadExtended {
+            data: MadCarryDetails {
+                kind: if cc { CarryKind::CarryInCarryOut } else { CarryKind::CarryIn },
+                control: mode.into(),
+                type_: type_
+            },
+            arguments: MadExtendedArgs { dst: d, src1: a, src2: b, src3: c }
+        }
+    }
+
+    .mode: RawMulIntControl = { .lo, .hi };
+    .type: ScalarType = { .u32, .s32, .u64, .s64 };
+
+    // https://docs.nvidia.com/cuda/parallel-thread-execution/#scalar-video-instructions-vshl-vshr
+    // This one gets custom handling because the type modifiers are at the start
+    // of the instruction instead of all being before the registers
+    vshr <= {
+        vshr(stream, |mode, op2, d, a, b, c| {
+            Instruction::Vshr {
+                data: VshData {
+                    mode: mode,
+                    op2: op2,
+                },
+                arguments: VshrArgs { dst: d, src1: a, src2: b, src3: c }
+            }
+        })
+    }
+
+    // https://docs.nvidia.com/cuda/parallel-thread-execution/#texture-instructions-tex
+    tex.1d.v4.dtype.ctype  d, [a, c] => {
+        Instruction::Tex {
+            data: TexData {
+                dtype,
+                ctype,
+                dims: TexDimensions::D1,
+                type_: TexType::Ref
+            },
+            arguments: TexArgs { dst: d, src_ptr: a, src_coord: c }
+        }
+    }
+    tex.2d.v4.dtype.ctype  d, [a, c] => {
+        Instruction::Tex {
+            data: TexData {
+                dtype,
+                ctype,
+                dims: TexDimensions::D2,
+                type_: TexType::Ref
+            },
+            arguments: TexArgs { dst: d, src_ptr: a, src_coord: c }
+        }
+    }
+    tex.3d.v4.dtype.ctype  d, [a, c] => {
+        Instruction::Tex {
+            data: TexData {
+                dtype,
+                ctype,
+                dims: TexDimensions::D3,
+                type_: TexType::Ref
+            },
+            arguments: TexArgs { dst: d, src_ptr: a, src_coord: c }
+        }
+    }
+
+    .dtype: ScalarType = { .u32, .s32, .f32 };
+    .ctype: ScalarType = { .s32, .f32 };
+
+    // https://docs.nvidia.com/cuda/parallel-thread-execution/#surface-instructions-suld
+    suld.b.1d{.vec}.dtype.clamp  d, [a, b] => {
+        let _ = clamp;
+        Instruction::Suld {
+            data: SuldData {
+                dst_type: Type::maybe_vector(vec, dtype),
+                dims: TexDimensions::D1,
+                type_: TexType::Ref
+            },
+            arguments: SuldArgs { dst: d, src_ptr: a, src_coord: b }
+        }
+    }
+
+    suld.b.2d{.vec}.dtype.clamp  d, [a, b] => {
+        let _ = clamp;
+        Instruction::Suld {
+            data: SuldData {
+                dst_type: Type::maybe_vector(vec, dtype),
+                dims: TexDimensions::D2,
+                type_: TexType::Ref
+            },
+            arguments: SuldArgs { dst: d, src_ptr: a, src_coord: b }
+        }
+    }
+
+    suld.b.3d{.vec}.dtype.clamp  d, [a, b] => {
+        let _ = clamp;
+        Instruction::Suld {
+            data: SuldData {
+                dst_type: Type::maybe_vector(vec, dtype),
+                dims: TexDimensions::D3,
+                type_: TexType::Ref
+            },
+            arguments: SuldArgs { dst: d, src_ptr: a, src_coord: b }
+        }
+    }
+
+    // .cop   = { .ca, .cg, .cs, .cv };
+    .vec: VectorPrefix = { .v2, .v4 };
+    .dtype: ScalarType = { .b8 , .b16, .b32, .b64 };
+    .clamp: ClampMode = { .trap, .clamp, .zero };
+
+    // https://docs.nvidia.com/cuda/parallel-thread-execution/index.html#surface-instructions-sust
+
+    sust.b.1d{.vec}.ctype.clamp  [a, b], c => {
+        let _ = clamp;
+        Instruction::Sust {
+            data: SuldData {
+                dst_type: Type::maybe_vector(vec, ctype),
+                dims: TexDimensions::D1,
+                type_: TexType::Ref
+            },
+            arguments: SustArgs { src_ptr: a, src_coord: b, src_data: c }
+        }
+    }
+
+    sust.b.2d{.vec}.ctype.clamp  [a, b], c => {
+        let _ = clamp;
+        Instruction::Sust {
+            data: SuldData {
+                dst_type: Type::maybe_vector(vec, ctype),
+                dims: TexDimensions::D2,
+                type_: TexType::Ref
+            },
+            arguments: SustArgs { src_ptr: a, src_coord: b, src_data: c }
+        }
+    }
+
+    sust.b.3d{.vec}.ctype.clamp  [a, b], c => {
+        let _ = clamp;
+        Instruction::Sust {
+            data: SuldData {
+                dst_type: Type::maybe_vector(vec, ctype),
+                dims: TexDimensions::D3,
+                type_: TexType::Ref
+            },
+            arguments: SustArgs { src_ptr: a, src_coord: b, src_data: c }
+        }
+    }
+
+    .vec: VectorPrefix   = { .v2, .v4 };
+    .ctype: ScalarType = { .b8 , .b16, .b32, .b64 };
+    .clamp: ClampMode = { .trap, .clamp, .zero };
+
+    // https://docs.nvidia.com/cuda/parallel-thread-execution/
+    match.any.sync.type  d, a, membermask => {
+        Instruction::MatchSync {
+            data: type_,
+            arguments: MatchSyncArgs { dst: d, src: a, src_membermask: membermask }
+        }
+    }
+
+    .type: ScalarType = { .b32, .b64 };
+
 );
 
 #[cfg(test)]
 mod tests {
     use crate::first_optional;
     use crate::module;
+    use crate::multi_variable;
     use crate::parse_module_checked;
     use crate::section;
     use crate::PtxError;
@@ -4206,6 +4620,51 @@ mod tests {
     use logos::Logos;
     use logos::Span;
     use winnow::prelude::*;
+
+    #[test]
+    fn sink_is_not_an_identifier() {
+        let tokens = Token::lexer("_ _reg __ %r1")
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(
+            tokens,
+            vec![
+                Token::Sink,
+                Token::Ident("_reg"),
+                Token::Ident("__"),
+                Token::Ident("%r1")
+            ]
+        );
+    }
+
+    #[test]
+    fn vector_operand_preserves_sink_positions() {
+        let text = "{_, %r1, _, 7}";
+        let tokens = Token::lexer(text)
+            .map(|t| t.map(|t| (t, Span::default())))
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        let mut errors = Vec::new();
+        let stream = super::PtxParser {
+            input: &tokens[..],
+            state: PtxParserState::new(text, &mut errors),
+        };
+        let operand = crate::ParsedOperand::<&str>::parse.parse(stream).unwrap();
+        let crate::ParsedOperand::VecPack(ref elements) = operand else {
+            panic!("expected a vector operand");
+        };
+        assert_eq!(
+            elements,
+            &vec![
+                None,
+                Some(crate::RegOrImmediate::Reg("%r1")),
+                None,
+                Some(crate::RegOrImmediate::Imm(crate::ImmediateValue::S64(7))),
+            ]
+        );
+        assert_eq!(operand.to_string(), text);
+        assert!(errors.is_empty());
+    }
 
     #[test]
     fn first_optional_present() {
@@ -4302,6 +4761,17 @@ mod tests {
         };
         assert!(target.parse(stream).is_err());
         assert_eq!(errors.len(), 0);
+    }
+
+    #[test]
+    fn ptr_param_alignment_is_the_pointees() {
+        let text = ".version 7.0\n.target sm_80\n.address_size 64\n.visible .entry k(.param .u8 a, .param .u64 .ptr .global .align 1 p)\n{\n\tret;\n}\n";
+        let module = super::parse_module_checked(text).unwrap();
+        let [super::ast::Directive::Method(_, method)] = &module.directives[..] else {
+            panic!()
+        };
+        let params = &method.func_directive.input_arguments;
+        assert_eq!((params[1].name, params[1].info.align), ("p", None));
     }
 
     #[test]
@@ -4529,6 +4999,33 @@ mod tests {
     }
 
     #[test]
+    fn dont_report_ignored_directives() {
+        let text = "
+            .version 6.5
+            .target sm_30
+            .address_size 64
+
+            .file 1 \"example.cu\"
+
+            .visible .entry func1()
+            {
+                ret;
+            }";
+        let tokens = Token::lexer(text)
+            .map(|t| t.map(|t| (t, Span::default())))
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        let mut errors = Vec::new();
+        let stream = super::PtxParser {
+            input: &tokens[..],
+            state: PtxParserState::new(text, &mut errors),
+        };
+        let module = module.parse(stream).unwrap();
+        assert_eq!(module.directives.len(), 1);
+        assert_eq!(module.invalid_directives, 0);
+    }
+
+    #[test]
     fn extern_func_noreturn() {
         let text = ".version 6.4
 .target sm_70
@@ -4548,5 +5045,78 @@ mod tests {
         let result = module.parse(stream);
         assert!(result.is_ok(), "Failed to parse extern func with .noreturn");
         assert_eq!(errors.len(), 0);
+    }
+
+    #[test]
+    fn const_zero_pad() {
+        let text = ".align 4 .b8 constData[8]";
+        let tokens = Token::lexer(text)
+            .map(|t| t.map(|t| (t, Span::default())))
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        let mut errors = Vec::new();
+        let stream = super::PtxParser {
+            input: &tokens[..],
+            state: PtxParserState::new(text, &mut errors),
+        };
+        let result = multi_variable(false, crate::StateSpace::Const)
+            .parse(stream)
+            .unwrap();
+        let result = match result {
+            crate::ast::MultiVariable::Names { info, .. } => info,
+            _ => panic!(),
+        };
+        assert_eq!(
+            result.array_init,
+            vec![crate::RegOrImmediate::Imm(crate::ImmediateValue::U64(0)); 8]
+        );
+    }
+
+    #[test]
+    fn global_zero_init() {
+        let text = ".align 4 .b8 constData";
+        let tokens = Token::lexer(text)
+            .map(|t| t.map(|t| (t, Span::default())))
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        let mut errors = Vec::new();
+        let stream = super::PtxParser {
+            input: &tokens[..],
+            state: PtxParserState::new(text, &mut errors),
+        };
+        let result = multi_variable(false, crate::StateSpace::Global)
+            .parse(stream)
+            .unwrap();
+        let result = match result {
+            crate::ast::MultiVariable::Names { info, .. } => info,
+            _ => panic!(),
+        };
+        assert_eq!(
+            result.array_init,
+            vec![crate::RegOrImmediate::Imm(crate::ImmediateValue::U64(0))]
+        );
+    }
+
+    #[test]
+    fn signed_immediate() {
+        fn parse_value(text: &str) -> crate::ImmediateValue {
+            let tokens = Token::lexer(text)
+                .map(|t| t.map(|t| (t, Span::default())))
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap();
+            let mut errors = Vec::new();
+            let stream = super::PtxParser {
+                input: &tokens[..],
+                state: PtxParserState::new(text, &mut errors),
+            };
+            let result = super::immediate_value.parse(stream).unwrap();
+            assert!(errors.is_empty());
+            result
+        }
+
+        assert_eq!(parse_value("-42"), crate::ImmediateValue::S64(-42));
+        assert_eq!(parse_value("-1.5"), crate::ImmediateValue::F64(-1.5));
+        assert_eq!(parse_value("-1.5e-2"), crate::ImmediateValue::F64(-0.015));
+        assert_eq!(parse_value("-1.5E+2"), crate::ImmediateValue::F64(-150.0));
     }
 }

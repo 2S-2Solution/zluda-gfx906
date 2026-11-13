@@ -1,33 +1,79 @@
 use cuda_types::{cublas::*, cublaslt::*};
 use hip_runtime_sys::hipStream_t;
 use hipblaslt_sys::*;
-use std::mem;
-use zluda_common::{from_cuda_object, FromCuda, ZludaObject};
+use std::{mem, sync::OnceLock};
+use zluda_common::{constants, FromCuda, ZludaObject};
+
+fn hipblaslt() -> Result<&'static super::HipblasltVtable, hipblasLtError> {
+    static LOCK: OnceLock<Result<super::HipblasltVtable, hipblasLtError>> = OnceLock::new();
+    let unwrapped: &Result<super::HipblasltVtable, hipblasLtError> =
+        LOCK.get_or_init(|| unsafe { super::HipblasltVtable::new() });
+    unwrapped.as_ref().map_err(|x| *x)
+}
 
 pub struct Handle {
     handle: hipblasLtHandle_t,
 }
 
 impl Handle {
-    fn new() -> Self {
-        Self {
-            handle: unsafe { mem::zeroed() },
-        }
+    fn new(handle: hipblasLtHandle_t) -> Self {
+        Self { handle }
     }
 }
 
 impl ZludaObject for Handle {
-    const COOKIE: usize = 0x49dec801578301ee;
-
+    const COOKIE: usize = 0xd1d9cb43416c9620;
     type Error = cublasError_t;
     type CudaHandle = cublasLtHandle_t;
-
     fn drop_checked(&mut self) -> cublasStatus_t {
+        unsafe { hipblaslt()?.hipblasLtDestroy(self.handle) }?;
         Ok(())
     }
 }
 
-from_cuda_object!(Handle);
+#[repr(transparent)]
+struct WrappedCublasLtHandle(cublasLtHandle_t);
+
+unsafe impl Send for WrappedCublasLtHandle {}
+unsafe impl Sync for WrappedCublasLtHandle {}
+
+// This is repr(c) because it needs to be compatible with Handle in zluda_blas.
+#[repr(C)]
+struct BlasHandle {
+    blas_lt: WrappedCublasLtHandle,
+}
+
+impl ZludaObject for BlasHandle {
+    const COOKIE: usize = constants::BLAS_HANDLE_COOKIE;
+    type Error = cublasError_t;
+    type CudaHandle = cublasLtHandle_t;
+    fn drop_checked(&mut self) -> cublasStatus_t {
+        // This is managed by zluda_blas
+        Ok(())
+    }
+}
+
+#[allow(unused_imports)]
+impl<'a> FromCuda<'a, cublasLtHandle_t, cublasError_t> for &'a Handle {
+    fn from_cuda(handle: &'a cublasLtHandle_t) -> Result<&'a Handle, cublasError_t> {
+        // Try interpreting as a direct BlasLtHandle
+        let live_check = zluda_common::as_ref(handle).ok_or(cublasError_t::INVALID_VALUE)?;
+        if let Ok(blas_lt) = live_check.as_result() {
+            return Ok(blas_lt);
+        }
+
+        // Fallback: handle may be a BlasHandle with an embedded BlasLtHandle
+        let live_check =
+            zluda_common::as_ref::<BlasHandle>(handle).ok_or(cublasError_t::INVALID_VALUE)?;
+        let blas_handle = live_check.as_result()?;
+        Ok(zluda_common::as_ref::<Handle>(&blas_handle.blas_lt.0)
+            .ok_or(cublasError_t::INVALID_VALUE)?
+            .as_result()?)
+    }
+}
+const _: fn() = || {
+    let _ = std::mem::transmute::<<Handle as zluda_common::ZludaObject>::CudaHandle, usize>;
+};
 
 #[cfg(debug_assertions)]
 pub(crate) fn unimplemented() -> cublasStatus_t {
@@ -39,22 +85,21 @@ pub(crate) fn unimplemented() -> cublasStatus_t {
     Err(cublasError_t::NOT_SUPPORTED)
 }
 
-// VEGA-PATCH 2026-06-28 sprint-orch v2 cublasLt-1: get_status_name real impl
+// Same as in zluda_blas
 pub(crate) fn get_status_name(status: cublasStatus_t) -> *const ::core::ffi::c_char {
-    let name: &'static [u8] = match status {
-        Ok(()) => b"CUBLAS_STATUS_SUCCESS\0",
-        Err(cublasError_t::NOT_INITIALIZED) => b"CUBLAS_STATUS_NOT_INITIALIZED\0",
-        Err(cublasError_t::ALLOC_FAILED) => b"CUBLAS_STATUS_ALLOC_FAILED\0",
-        Err(cublasError_t::INVALID_VALUE) => b"CUBLAS_STATUS_INVALID_VALUE\0",
-        Err(cublasError_t::ARCH_MISMATCH) => b"CUBLAS_STATUS_ARCH_MISMATCH\0",
-        Err(cublasError_t::MAPPING_ERROR) => b"CUBLAS_STATUS_MAPPING_ERROR\0",
-        Err(cublasError_t::EXECUTION_FAILED) => b"CUBLAS_STATUS_EXECUTION_FAILED\0",
-        Err(cublasError_t::INTERNAL_ERROR) => b"CUBLAS_STATUS_INTERNAL_ERROR\0",
-        Err(cublasError_t::NOT_SUPPORTED) => b"CUBLAS_STATUS_NOT_SUPPORTED\0",
-        Err(cublasError_t::LICENSE_ERROR) => b"CUBLAS_STATUS_LICENSE_ERROR\0",
-        Err(_) => b"CUBLAS_STATUS_UNKNOWN\0",
-    };
-    name.as_ptr() as *const ::core::ffi::c_char
+    match status {
+        cublasStatus_t::SUCCESS => c"CUBLAS_STATUS_SUCCESS".as_ptr(),
+        cublasStatus_t::ERROR_NOT_INITIALIZED => c"CUBLAS_STATUS_NOT_INITIALIZED".as_ptr(),
+        cublasStatus_t::ERROR_ALLOC_FAILED => c"CUBLAS_STATUS_ALLOC_FAILED".as_ptr(),
+        cublasStatus_t::ERROR_INVALID_VALUE => c"CUBLAS_STATUS_INVALID_VALUE".as_ptr(),
+        cublasStatus_t::ERROR_ARCH_MISMATCH => c"CUBLAS_STATUS_ARCH_MISMATCH".as_ptr(),
+        cublasStatus_t::ERROR_MAPPING_ERROR => c"CUBLAS_STATUS_MAPPING_ERROR".as_ptr(),
+        cublasStatus_t::ERROR_EXECUTION_FAILED => c"CUBLAS_STATUS_EXECUTION_FAILED".as_ptr(),
+        cublasStatus_t::ERROR_INTERNAL_ERROR => c"CUBLAS_STATUS_INTERNAL_ERROR".as_ptr(),
+        cublasStatus_t::ERROR_NOT_SUPPORTED => c"CUBLAS_STATUS_NOT_SUPPORTED".as_ptr(),
+        cublasStatus_t::ERROR_LICENSE_ERROR => c"CUBLAS_STATUS_LICENSE_ERROR".as_ptr(),
+        _ => c"CUBLAS_STATUS_UNKNOWN".as_ptr(),
+    }
 }
 
 // VEGA-PATCH 2026-06-28 sprint-orch v2 cublasLt-2: get_status_string real impl
@@ -195,14 +240,27 @@ pub(crate) fn matmul_preference_init_internal(
 }
 
 pub(crate) fn create(handle: &mut cublasLtHandle_t) -> cublasStatus_t {
-    let mut zluda_blaslt_handle = Handle::new();
-    unsafe { hipblasLtCreate(&mut zluda_blaslt_handle.handle) }?;
-    *handle = Handle::wrap(zluda_blaslt_handle);
+    let mut hipblas_lt = unsafe { std::mem::zeroed() };
+    unsafe { hipblaslt()?.hipblasLtCreate(&mut hipblas_lt) }?;
+
+    let zluda_handle = Handle::new(hipblas_lt);
+
+    *handle = Handle::wrap(zluda_handle);
     Ok(())
 }
 
 pub(crate) fn destroy(handle: cublasLtHandle_t) -> cublasStatus_t {
-    zluda_common::drop_checked::<Handle>(handle)
+    // Try interpreting as a direct BlasLtHandle
+    let result = zluda_common::drop_checked::<Handle>(handle);
+    if result != cublasStatus_t::ERROR_INVALID_VALUE {
+        return result;
+    }
+
+    // Fallback: handle may be a BlasHandle with an embedded blas_lt
+    let blas_handle = zluda_common::as_ref::<BlasHandle>(&handle)
+        .ok_or(cublasError_t::INVALID_VALUE)?
+        .as_result()?;
+    zluda_common::drop_checked::<Handle>(blas_handle.blas_lt.0)
 }
 
 fn cuda_algo_from_hip(hip: hipblasLtMatmulAlgo_t) -> cublasLtMatmulAlgo_t {
@@ -233,7 +291,7 @@ pub(crate) fn matmul(
     stream: hipStream_t,
 ) -> cublasStatus_t {
     unsafe {
-        hipblasLtMatmul(
+        hipblaslt()?.hipblasLtMatmul(
             light_handle.handle,
             compute_desc,
             alpha,
@@ -269,7 +327,7 @@ pub(crate) fn matmul_algo_get_heuristic(
 ) -> cublasStatus_t {
     let mut hip_algos = vec![unsafe { mem::zeroed() }; requested_algo_count as usize];
     unsafe {
-        hipblasLtMatmulAlgoGetHeuristic(
+        hipblaslt()?.hipblasLtMatmulAlgoGetHeuristic(
             light_handle.handle,
             operation_desc,
             a_desc,
@@ -305,12 +363,12 @@ pub(crate) fn matmul_desc_create(
     compute_type: hipblasComputeType_t,
     scale_type: hipDataType,
 ) -> cublasStatus_t {
-    unsafe { hipblasLtMatmulDescCreate(matmul_desc, compute_type, scale_type) }?;
+    unsafe { hipblaslt()?.hipblasLtMatmulDescCreate(matmul_desc, compute_type, scale_type) }?;
     Ok(())
 }
 
 pub(crate) fn matmul_desc_destroy(matmul_desc: hipblasLtMatmulDesc_t) -> cublasStatus_t {
-    unsafe { hipblasLtMatmulDescDestroy(matmul_desc) }?;
+    unsafe { hipblaslt()?.hipblasLtMatmulDescDestroy(matmul_desc) }?;
     Ok(())
 }
 
@@ -356,9 +414,9 @@ pub(crate) fn matmul_desc_set_attribute(
         hipblasLtMatmulDescAttributes_t::HIPBLASLT_MATMUL_DESC_BIAS_DATA_TYPE => {
             convert_and_set_attribute::<cudaDataType, hipDataType>(matmul_desc, buf, hip_attr)?
         }
-        hipblasLtMatmulDescAttributes_t::HIPBLASLT_MATMUL_DESC_BIAS_POINTER => {
-            unsafe { hipblasLtMatmulDescSetAttribute(matmul_desc, hip_attr, buf, size_in_bytes) }?
-        }
+        hipblasLtMatmulDescAttributes_t::HIPBLASLT_MATMUL_DESC_BIAS_POINTER => unsafe {
+            hipblaslt()?.hipblasLtMatmulDescSetAttribute(matmul_desc, hip_attr, buf, size_in_bytes)
+        }?,
         _ => return cublasStatus_t::ERROR_NOT_SUPPORTED,
     }
     Ok(())
@@ -377,7 +435,7 @@ where
     let hip_operation: HipType = FromCuda::<_, cublasError_t>::from_cuda(cublas_operation)?;
     let hip_buf: *const HipType = &hip_operation;
     unsafe {
-        hipblasLtMatmulDescSetAttribute(
+        hipblaslt()?.hipblasLtMatmulDescSetAttribute(
             matmul_desc,
             hip_attr,
             hip_buf.cast(),
@@ -388,22 +446,32 @@ where
 }
 
 pub(crate) fn matmul_preference_create(pref: &mut hipblasLtMatmulPreference_t) -> cublasStatus_t {
-    unsafe { hipblasLtMatmulPreferenceCreate(pref) }?;
+    unsafe { hipblaslt()?.hipblasLtMatmulPreferenceCreate(pref) }?;
     Ok(())
 }
 
 pub(crate) fn matmul_preference_destroy(pref: hipblasLtMatmulPreference_t) -> cublasStatus_t {
-    unsafe { hipblasLtMatmulPreferenceDestroy(pref) }?;
+    unsafe { hipblaslt()?.hipblasLtMatmulPreferenceDestroy(pref) }?;
     Ok(())
 }
 
 pub(crate) fn matmul_preference_set_attribute(
     pref: hipblasLtMatmulPreference_t,
-    attr: hipblasLtMatmulPreferenceAttributes_t,
+    attr: cublasLtMatmulPreferenceAttributes_t,
     buf: *const ::core::ffi::c_void,
     size_in_bytes: usize,
 ) -> cublasStatus_t {
-    unsafe { hipblasLtMatmulPreferenceSetAttribute(pref, attr, buf, size_in_bytes) }?;
+    match attr {
+        cublasLtMatmulPreferenceAttributes_t::CUBLASLT_MATMUL_PREF_MIN_ALIGNMENT_A_BYTES
+        | cublasLtMatmulPreferenceAttributes_t::CUBLASLT_MATMUL_PREF_MIN_ALIGNMENT_B_BYTES
+        | cublasLtMatmulPreferenceAttributes_t::CUBLASLT_MATMUL_PREF_MIN_ALIGNMENT_C_BYTES
+        | cublasLtMatmulPreferenceAttributes_t::CUBLASLT_MATMUL_PREF_MIN_ALIGNMENT_D_BYTES => {
+            return Ok(());
+        }
+        _ => {}
+    }
+    let attr = FromCuda::<_, cublasError_t>::from_cuda(&attr)?;
+    unsafe { hipblaslt()?.hipblasLtMatmulPreferenceSetAttribute(pref, attr, buf, size_in_bytes) }?;
     Ok(())
 }
 
@@ -414,12 +482,12 @@ pub(crate) fn matrix_layout_create(
     cols: u64,
     ld: i64,
 ) -> cublasStatus_t {
-    unsafe { hipblasLtMatrixLayoutCreate(mat_layout, type_, rows, cols, ld) }?;
+    unsafe { hipblaslt()?.hipblasLtMatrixLayoutCreate(mat_layout, type_, rows, cols, ld) }?;
     Ok(())
 }
 
 pub(crate) fn matrix_layout_destroy(mat_layout: hipblasLtMatrixLayout_t) -> cublasStatus_t {
-    unsafe { hipblasLtMatrixLayoutDestroy(mat_layout) }?;
+    unsafe { hipblaslt()?.hipblasLtMatrixLayoutDestroy(mat_layout) }?;
     Ok(())
 }
 
@@ -429,6 +497,8 @@ pub(crate) fn matrix_layout_set_attribute(
     buf: *const ::core::ffi::c_void,
     size_in_bytes: usize,
 ) -> cublasStatus_t {
-    unsafe { hipblasLtMatrixLayoutSetAttribute(mat_layout, attr, buf, size_in_bytes) }?;
+    unsafe {
+        hipblaslt()?.hipblasLtMatrixLayoutSetAttribute(mat_layout, attr, buf, size_in_bytes)
+    }?;
     Ok(())
 }

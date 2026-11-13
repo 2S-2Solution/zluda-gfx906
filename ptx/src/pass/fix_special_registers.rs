@@ -19,11 +19,8 @@ pub(super) fn run<'a, 'input>(
                 import_as: None,
                 tuning: Vec::new(),
                 linkage: ast::LinkingDirective::EXTERN,
-                is_kernel: false,
-                flush_to_zero_f32: false,
-                flush_to_zero_f16f64: false,
-                rounding_mode_f32: ptx_parser::RoundingMode::NearestEven,
-                rounding_mode_f16f64: ptx_parser::RoundingMode::NearestEven,
+                kernel_attributes: None,
+                kernel_meta32: None,
             }));
             sreg_to_function.insert(sreg, name);
         },
@@ -64,7 +61,7 @@ fn run_method<'a, 'input>(
             Ok::<_, TranslateError>(result)
         })
         .transpose()?;
-    Ok(Function2 { body, ..method })
+    Ok(Function { body, ..method })
 }
 
 fn run_statement<'a, 'input>(
@@ -203,10 +200,10 @@ pub fn map_operand<T: Copy, Err>(
             elements
                 .into_iter()
                 .map(|element| match element {
-                    ast::RegOrImmediate::Reg(ident) => {
-                        Ok(ast::RegOrImmediate::Reg(fn_(ident, None)?.unwrap_or(ident)))
-                    }
-                    ast::RegOrImmediate::Imm(imm) => Ok(ast::RegOrImmediate::Imm(imm)),
+                    Some(ast::RegOrImmediate::Reg(ident)) => Ok(Some(ast::RegOrImmediate::Reg(
+                        fn_(ident, None)?.unwrap_or(ident),
+                    ))),
+                    other => Ok(other),
                 })
                 .collect::<Result<Vec<_>, _>>()?,
         ),

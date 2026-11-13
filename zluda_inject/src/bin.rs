@@ -4,13 +4,10 @@ use bpaf::Parser;
 use rustc_hash::FxHashSet;
 use std::error::Error;
 use std::ffi::{CString, OsStr};
+use std::os::windows::ffi::OsStrExt;
 use std::path::PathBuf;
 use std::{env, mem, process, ptr};
-use windows::Win32::Foundation::{HANDLE, WAIT_FAILED};
-use windows::Win32::System::JobObjects::{
-    AssignProcessToJobObject, JobObjectExtendedLimitInformation, SetInformationJobObject,
-    JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
-};
+use windows::Win32::Foundation::{ERROR_CANCELLED, HANDLE, WAIT_FAILED};
 use windows::Win32::System::Threading::{
     self, GetExitCodeProcess, ResumeThread, WaitForSingleObject, CREATE_SUSPENDED,
     CREATE_UNICODE_ENVIRONMENT,
@@ -41,9 +38,30 @@ macro_rules! os_call {
 }
 
 pub fn main_impl() -> Result<(), Box<dyn Error>> {
-    let args = args::arguments().run();
+    let mut application_name = None;
+    let args = if env::args_os().nth(1).is_none() {
+        let exe = match crate::win::select_executable() {
+            Ok(exe) => exe,
+            Err(err) if err.error_code == ERROR_CANCELLED.0 => return Ok(()),
+            Err(err) => return Err(Box::new(err)),
+        };
+        application_name = Some(
+            exe.encode_wide()
+                .chain(std::iter::once(0))
+                .collect::<Vec<_>>(),
+        );
+        args::Arguments {
+            paths: args::ConfigSet::Zluda,
+            exe,
+            args: Vec::new(),
+        }
+    } else {
+        args::arguments().run()
+    };
     let injection_env = InjectionConfig::new(args.clone())?;
-    let mut command_line = args.command_line_zero_terminated();
+    let mut command_line = application_name
+        .is_none()
+        .then(|| args.command_line_zero_terminated());
     let mut startup_info = unsafe { mem::zeroed::<detours_sys::_STARTUPINFOW>() };
     let mut proc_info = unsafe { mem::zeroed::<detours_sys::_PROCESS_INFORMATION>() };
     let mut env_vars_block = injection_env.get_env_variables_block()?;
@@ -54,8 +72,12 @@ pub fn main_impl() -> Result<(), Box<dyn Error>> {
         .collect::<Vec<_>>();
     os_call! {
         detours_sys::DetourCreateProcessWithDllsW(
-            ptr::null(),
-            command_line.as_mut_ptr(),
+            application_name
+                .as_ref()
+                .map_or(ptr::null(), |application_name| application_name.as_ptr()),
+            command_line
+                .as_mut()
+                .map_or(ptr::null_mut(), |command_line| command_line.as_mut_ptr()),
             ptr::null_mut(),
             ptr::null_mut(),
             0,
@@ -69,7 +91,7 @@ pub fn main_impl() -> Result<(), Box<dyn Error>> {
             Option::None
         )
     };
-    kill_child_on_process_exit(proc_info.hProcess)?;
+    zluda_windows::kill_child_on_process_exit(proc_info.hProcess)?;
     injection_env.copy_payloads_to_process(proc_info.hProcess)?;
     os_call! { ResumeThread(HANDLE(proc_info.hThread)), |x| x == -1i32 as u32 };
     os_call! { WaitForSingleObject(HANDLE(proc_info.hProcess), Threading::INFINITE), |x| x == WAIT_FAILED };
@@ -323,6 +345,9 @@ impl InjectionConfig {
             write!(&mut result, "{}={}\0", var.display(), value.display())?;
             known_vars.insert(value);
         }
+        if !known_vars.contains(OsStr::new("TORCH_CUDNN_V8_API_DISABLED")) {
+            write!(&mut result, "TORCH_CUDNN_V8_API_DISABLED=1\0")?;
+        }
         for (key, value) in self.env_vars.iter() {
             let x: &OsStr = key.as_ref();
             if known_vars.contains(x) {
@@ -334,20 +359,4 @@ impl InjectionConfig {
         result.push_char('\0');
         Ok(result.into_vec())
     }
-}
-
-fn kill_child_on_process_exit(child: detours_sys::HANDLE) -> Result<(), Box<dyn Error>> {
-    let job_handle = unsafe { windows::Win32::System::JobObjects::CreateJobObjectA(None, None) }?;
-    let mut info = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
-    info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
-    unsafe {
-        SetInformationJobObject(
-            job_handle,
-            JobObjectExtendedLimitInformation,
-            &mut info as *mut _ as *mut _,
-            size_of_val(&info) as u32,
-        )
-    }?;
-    unsafe { AssignProcessToJobObject(job_handle, HANDLE(child)) }?;
-    Ok(())
 }

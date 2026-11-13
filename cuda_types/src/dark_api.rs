@@ -68,9 +68,12 @@ bitflags! {
     pub struct FatbinFileHeaderFlags: u64 {
         const Is64Bit = 0x0000000000000001;
         const Debug = 0x0000000000000002;
+        const CUDA = 0x0000000000000004;
+        const OpenCL = 0x0000000000000008;
         const Linux = 0x0000000000000010;
         const Mac = 0x0000000000000020;
         const Windows = 0x0000000000000040;
+        const CompressedDeflate = 0x0000000000001000;
         const CompressedLz4 = 0x0000000000002000;
         const CompressedZstd = 0x0000000000008000;
 

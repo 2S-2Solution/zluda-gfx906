@@ -15,12 +15,11 @@ use llvm_sys::{
 };
 use llvm_sys::{LLVMLinkage, LLVMVisibility};
 use std::ffi::{CStr, CString};
-use std::fs;
 use std::sync::OnceLock;
+use std::{fs, ptr};
 use tempfile::NamedTempFile;
 
 const OCKL_MODULE: &[u8] = include_bytes!("device-libs/ockl.bc");
-const OCML_MODULE: &[u8] = include_bytes!("device-libs/ocml.bc");
 
 // https://llvm.org/docs/AMDGPUUsage.html#address-spaces
 const CONSTANT_ADDRESS_SPACE: u32 = 4;
@@ -97,6 +96,8 @@ pub fn compile(
     main: Module,
     ptx_impl: &[u8],
     attributes: Module,
+    metadata: kernel_metadata::ModuleMetadataV1,
+    metadata32: Option<kernel_metadata::ModuleMetadata32Bit>,
     compiler_hook: Option<&dyn Fn(&Vec<u8>, String)>,
 ) -> Result<Vec<u8>, String> {
     init_globals()?;
@@ -105,7 +106,6 @@ pub fn compile(
 
     let ptx_impl = load_module(ctx, ptx_impl, c"ptx_impl.bc")?;
     let ockl = load_module(ctx, OCKL_MODULE, c"ockl.bc")?;
-    let ocml = load_module(ctx, OCML_MODULE, c"ocml.bc")?;
 
     let oclc_constants = create_oclc_constants(ctx, gcn_arch)?;
 
@@ -114,7 +114,6 @@ pub fn compile(
     linked.link(oclc_constants)?;
     linked.link(ptx_impl)?;
     linked.link(ockl)?;
-    linked.link(ocml)?;
 
     linked.verify()?;
 
@@ -337,11 +336,20 @@ pub fn compile(
                 }
             }
             obj_bytes.ok_or_else(|| "clang failed: stack-size irresolubile dopo stub".to_string())?
-        } else {
-            // Fallback: codegen in-process se clang esterno non disponibile
+        } else if std::env::var_os("ZLUDA_CODEGEN_INTERNO").is_some() {
+            // Codegen interno di LLVM: solo su richiesta. Misurato il 13 nov 2026 con LLVM 24 e la
+            // runtime HIP 5.7 del driver: il primo kernel (saxpy) fa cadere amdhip64.dll in
+            // sincronizzazione (lettura a 0x20). Da indagare prima di farne il ripiego normale.
             target_machine
                 .emit_to_memory_buffer(&linked, LLVMCodeGenFileType::LLVMObjectFile)?
                 .to_vec()
+        } else {
+            let msg = concat!(
+                "[ZLUDA] clang non trovato: serve clang\\clang.exe accanto a nvcuda.dll (o ZLUDA_CLANG) ",
+                "della stessa LLVM di ZLUDA; il codegen interno con la runtime HIP 5.7 non e' affidabile"
+            );
+            eprintln!("{}", msg);
+            return Err(msg.to_string());
         }
     };
 
@@ -351,22 +359,63 @@ pub fn compile(
     }
 
     let object_path = NamedTempFile::with_prefix("zluda.o")
-        .map_err(|_| ("Failed to create temporary file").to_string())?
+        .map_err(|e| format!("Failed to create temporary file: {}", e))?
         .into_temp_path();
+    let mut section_path = NamedTempFile::with_prefix("zluda_section")
+        .map_err(|e| format!("Failed to create temporary file: {}", e))?;
     let executable_path = NamedTempFile::with_prefix("zluda.elf")
-        .map_err(|_| ("Failed to create temporary file").to_string())?
+        .map_err(|e| format!("Failed to create temporary file: {}", e))?
         .into_temp_path();
 
     fs::write(&object_path, &object_file)
-        .map_err(|_| ("Failed to write object file").to_string())?;
+        .map_err(|e| format!("Failed to write object file: {}", e))?;
+    metadata
+        .write_object(&object_file, section_path.as_file_mut())
+        .map_err(|e| format!("Failed to write metadata section: {}", e))?;
+    let section32_path = if let Some(metadata32) = metadata32 {
+        let mut section32_path = NamedTempFile::with_prefix("zluda32_section")
+            .map_err(|e| format!("Failed to create temporary file: {}", e))?;
+        metadata32
+            .write_object(&object_file, section32_path.as_file_mut())
+            .map_err(|e| format!("Failed to write 32-bit metadata section: {}", e))?;
+        Some(section32_path)
+    } else {
+        None
+    };
 
     let object_path_cstr = path_to_cstring(&object_path)?;
+    let section_path_cstr = path_to_cstring(section_path.as_ref())?;
+    let section32_path_cstr = section32_path
+        .as_ref()
+        .map(|p| path_to_cstring(p.as_ref()))
+        .transpose()?;
     let executable_path_cstr = path_to_cstring(&executable_path)?;
+
+    let (inputs, inputs_len) = if let Some(ref section32_path_cstr) = section32_path_cstr {
+        (
+            [
+                object_path_cstr.as_ptr(),
+                section_path_cstr.as_ptr(),
+                section32_path_cstr.as_ptr(),
+            ],
+            3,
+        )
+    } else {
+        (
+            [
+                object_path_cstr.as_ptr(),
+                section_path_cstr.as_ptr(),
+                ptr::null(),
+            ],
+            2,
+        )
+    };
 
     let mut err = std::ptr::null_mut();
     let result = unsafe {
         LLVMZludaLinkWithLLD(
-            object_path_cstr.as_ptr(),
+            inputs_len,
+            inputs.as_ptr(),
             executable_path_cstr.as_ptr(),
             &mut err,
         )
@@ -451,12 +500,15 @@ fn init_globals() -> Result<(), String> {
                 // Uncomment to save passes
                 // c"-print-before-all",
                 c"llvm_zluda",
+                //c"-debug-only=isel",
                 c"-ignore-tti-inline-compatible",
                 // c"-amdgpu-early-inline-all=true",
                 c"-amdgpu-internalize-symbols=false",  // VEGA-FIX T12:45: preserva kernel exports per torch cuModuleGetFunction
                 c"-amdhsa-code-object-version=5",
+                //c"--pass-remarks-missed=.*inlin.*",
             ]
             .into_iter();
+            /* Does not provide as much performance improvement on ROCm 7.2
             let opt_options = if cfg!(debug_assertions) {
                 vec![]
             } else {
@@ -466,8 +518,9 @@ fn init_globals() -> Result<(), String> {
                     c"-inlinehint-threshold=3250",
                 ]
             };
+            */
             let llvm_args_ptrs: Vec<*const i8> = common_options
-                .chain(opt_options)
+                //.chain(opt_options)
                 .map(|s| s.as_ptr())
                 .collect();
             let mut err_msg = std::ptr::null_mut();
@@ -489,18 +542,71 @@ fn init_globals() -> Result<(), String> {
         })
         .as_ref()
         .map(|()| ())
-        .map_err(|e| e.to_str().to_owned())
+        .map_err(|e| e.to_str().to_string())
 }
 
+/// Il clang esterno che compila l'IR tradotto. Deve venire dalla STESSA LLVM che ZLUDA porta
+/// dentro di se' (ext/llvm-project): l'IR testuale non e' compatibile all'indietro. Dal merge di
+/// upstream del 13 nov 2026 la LLVM interna e' la 24 (ROCm LLVM 10.1) e scrive per esempio
+/// `denormal_fpenv(...)`, che il clang 21 di Marconi non sa leggere; per questo Marconi e la
+/// vecchia cartella C:\rocm_5_7_expansion_pack non si cercano piu'.
+/// Ordine: ZLUDA_CLANG, poi `clang\clang.exe` accanto a nvcuda.dll. Se non c'e' nessuno dei due
+/// il percorso restituito non esiste e compile() usa il codegen interno di LLVM.
 fn trova_clang() -> std::path::PathBuf {
     if let Ok(p) = std::env::var("ZLUDA_CLANG") {
         return std::path::PathBuf::from(p);
     }
-    if let Ok(r) = std::env::var("MARCONI_ROOT") {
-        let p = std::path::Path::new(&r).join("compiler").join("bin").join("clang.exe");
+    if let Some(dir) = cartella_modulo() {
+        let p = dir.join("clang").join("clang.exe");
         if p.exists() {
             return p;
         }
     }
-    std::path::PathBuf::from(r"C:\rocm_5_7_expansion_pack\compiler\bin\clang.exe")
+    std::path::PathBuf::new()
+}
+
+/// Nome del backend di codegen, per la chiave della cache dei moduli: un modulo compilato con il
+/// clang esterno non va riusato col codegen interno, e viceversa.
+pub fn backend() -> &'static str {
+    static B: OnceLock<&'static str> = OnceLock::new();
+    B.get_or_init(|| {
+        if trova_clang().exists() {
+            "clang24"
+        } else if std::env::var_os("ZLUDA_CODEGEN_INTERNO").is_some() {
+            "interno24"
+        } else {
+            "nessuno"
+        }
+    })
+}
+
+/// Cartella del modulo (DLL) che contiene questo codice, cioe' di nvcuda.dll.
+#[cfg(windows)]
+fn cartella_modulo() -> Option<std::path::PathBuf> {
+    use std::os::windows::ffi::OsStringExt;
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn GetModuleHandleExW(flags: u32, name: *const u16, module: *mut *mut std::ffi::c_void) -> i32;
+        fn GetModuleFileNameW(module: *mut std::ffi::c_void, buf: *mut u16, size: u32) -> u32;
+    }
+    const FROM_ADDRESS: u32 = 0x4;
+    const UNCHANGED_REFCOUNT: u32 = 0x2;
+    let mut module = std::ptr::null_mut();
+    let indirizzo = cartella_modulo as *const () as *const u16;
+    if unsafe { GetModuleHandleExW(FROM_ADDRESS | UNCHANGED_REFCOUNT, indirizzo, &mut module) } == 0 {
+        return None;
+    }
+    let mut buf = vec![0u16; 32768];
+    let n = unsafe { GetModuleFileNameW(module, buf.as_mut_ptr(), buf.len() as u32) } as usize;
+    if n == 0 || n >= buf.len() {
+        return None;
+    }
+    let mut p = std::path::PathBuf::from(std::ffi::OsString::from_wide(&buf[..n]));
+    p.pop();
+    Some(p)
+}
+
+#[cfg(not(windows))]
+fn cartella_modulo() -> Option<std::path::PathBuf> {
+    None
 }

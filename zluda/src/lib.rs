@@ -26,6 +26,7 @@ macro_rules! unimplemented {
             #[cfg_attr(not(test), no_mangle)]
             #[allow(improper_ctypes)]
             #[allow(improper_ctypes_definitions)]
+            #[allow(unused_variables)]
             pub unsafe extern $abi fn $fn_name ( $( $arg_id : $arg_type),* ) -> $ret_type {
                 // VEGA-DEBUG T10:05 23 giu: log unimplemented call per inchiodare quale chiama torch
                 use std::io::Write;
@@ -143,49 +144,7 @@ fn trace_tex(name: &'static str, code: u32) {
 }
 
 // ============ 5 API TEXTURE OBJECT ============
-#[cfg_attr(not(test), no_mangle)]
-#[allow(improper_ctypes)]
-#[allow(improper_ctypes_definitions)]
-pub unsafe extern "system" fn cuTexObjectCreate(
-    pTexObject: *mut cuda_types::cuda::CUtexObject,
-    pResDesc: *const cuda_types::cuda::CUDA_RESOURCE_DESC,
-    pTexDesc: *const cuda_types::cuda::CUDA_TEXTURE_DESC,
-    pResViewDesc: *const cuda_types::cuda::CUDA_RESOURCE_VIEW_DESC,
-) -> cuda_types::cuda::CUresult {
-    if !initialized() { return Err(CUerror::DEINITIALIZED); }
-    if pTexObject.is_null() || pResDesc.is_null() || pTexDesc.is_null() {
-        trace_tex("cuTexObjectCreate", 1);
-        return Err(CUerror::INVALID_VALUE);
-    }
-    let mut hip_tex: hip_runtime_sys::hipTextureObject_t = std::ptr::null_mut();
-    let hip_err = hip_runtime_sys::hipTexObjectCreate(
-        &mut hip_tex as *mut _,
-        pResDesc as *const hip_runtime_sys::HIP_RESOURCE_DESC,
-        pTexDesc as *const hip_runtime_sys::HIP_TEXTURE_DESC,
-        pResViewDesc as *const hip_runtime_sys::HIP_RESOURCE_VIEW_DESC,
-    );
-    let result = hip_to_cuda_result(hip_err);
-    if result.is_ok() {
-        *pTexObject = hip_to_cu_tex_obj(hip_tex);
-    }
-    let code = match &result { Ok(_) => 0u32, Err(e) => e.0.get() };
-    trace_tex("cuTexObjectCreate", code);
-    result
-}
 
-#[cfg_attr(not(test), no_mangle)]
-#[allow(improper_ctypes)]
-#[allow(improper_ctypes_definitions)]
-pub unsafe extern "system" fn cuTexObjectDestroy(
-    texObject: cuda_types::cuda::CUtexObject,
-) -> cuda_types::cuda::CUresult {
-    if !initialized() { return Err(CUerror::DEINITIALIZED); }
-    let hip_err = hip_runtime_sys::hipTexObjectDestroy(cu_to_hip_tex_obj(texObject));
-    let result = hip_to_cuda_result(hip_err);
-    let code = match &result { Ok(_) => 0u32, Err(e) => e.0.get() };
-    trace_tex("cuTexObjectDestroy", code);
-    result
-}
 
 #[cfg_attr(not(test), no_mangle)]
 #[allow(improper_ctypes)]
@@ -257,59 +216,7 @@ pub unsafe extern "system" fn cuTexObjectGetTextureDesc(
 // Surface: HIP espone solo l'API runtime hipCreateSurfaceObject(*hipResourceDesc).
 // Per CUDA spec resType deve essere ARRAY (CU_RESOURCE_TYPE_ARRAY = 0 = hipResourceTypeArray),
 // quindi costruiamo runtime-desc minimale dal driver-desc CUDA leggendo solo l'array handle.
-#[cfg_attr(not(test), no_mangle)]
-#[allow(improper_ctypes)]
-#[allow(improper_ctypes_definitions)]
-pub unsafe extern "system" fn cuSurfObjectCreate(
-    pSurfObject: *mut cuda_types::cuda::CUsurfObject,
-    pResDesc: *const cuda_types::cuda::CUDA_RESOURCE_DESC,
-) -> cuda_types::cuda::CUresult {
-    if !initialized() { return Err(CUerror::DEINITIALIZED); }
-    if pSurfObject.is_null() || pResDesc.is_null() {
-        trace_tex("cuSurfObjectCreate", 1);
-        return Err(CUerror::INVALID_VALUE);
-    }
-    let cu_desc = &*pResDesc;
-    // CUresourcetype: 0 = ARRAY (richiesto da spec cuSurfObjectCreate).
-    if cu_desc.resType.0 != 0 {
-        trace_tex("cuSurfObjectCreate", CUerror::INVALID_VALUE.0.get());
-        return Err(CUerror::INVALID_VALUE);
-    }
-    // Estrai hArray dal driver-form union.array.hArray (CUarray = *mut CUarray_st).
-    let h_array = cu_desc.res.array.hArray;
-    // Costruisci runtime-form hipResourceDesc per hipCreateSurfaceObject.
-    // hipArray_t è *mut hipArray (pointer 8 byte); CUarray è *mut CUarray_st (pointer 8 byte).
-    // Sono opaque handle, basta cast del puntatore.
-    let mut runtime_desc: hip_runtime_sys::hipResourceDesc = std::mem::zeroed();
-    runtime_desc.resType = hip_runtime_sys::hipResourceType::hipResourceTypeArray;
-    runtime_desc.res.array.array = h_array as hip_runtime_sys::hipArray_t;
-    let mut hip_surf: hip_runtime_sys::hipSurfaceObject_t = std::ptr::null_mut();
-    let hip_err = hip_runtime_sys::hipCreateSurfaceObject(
-        &mut hip_surf as *mut _,
-        &runtime_desc as *const _,
-    );
-    let result = hip_to_cuda_result(hip_err);
-    if result.is_ok() {
-        *pSurfObject = hip_to_cu_surf_obj(hip_surf);
-    }
-    let code = match &result { Ok(_) => 0u32, Err(e) => e.0.get() };
-    trace_tex("cuSurfObjectCreate", code);
-    result
-}
 
-#[cfg_attr(not(test), no_mangle)]
-#[allow(improper_ctypes)]
-#[allow(improper_ctypes_definitions)]
-pub unsafe extern "system" fn cuSurfObjectDestroy(
-    surfObject: cuda_types::cuda::CUsurfObject,
-) -> cuda_types::cuda::CUresult {
-    if !initialized() { return Err(CUerror::DEINITIALIZED); }
-    let hip_err = hip_runtime_sys::hipDestroySurfaceObject(cu_to_hip_surf_obj(surfObject));
-    let result = hip_to_cuda_result(hip_err);
-    let code = match &result { Ok(_) => 0u32, Err(e) => e.0.get() };
-    trace_tex("cuSurfObjectDestroy", code);
-    result
-}
 
 // No-op macro: i corpi delle 8 cuTex/cuSurf sono definiti sopra come #[no_mangle].
 // Questo macro viene chiamato dal proc_macro `cuda_function_declarations!` per le
@@ -590,39 +497,7 @@ pub unsafe extern "system" fn cuGraphicsGLRegisterImage(
     result
 }
 
-#[cfg_attr(not(test), no_mangle)]
-#[allow(improper_ctypes)]
-#[allow(improper_ctypes_definitions)]
-pub unsafe extern "system" fn cuGraphicsUnregisterResource(
-    resource: cuda_types::cuda::CUgraphicsResource,
-) -> cuda_types::cuda::CUresult {
-    if !initialized() { return Err(CUerror::DEINITIALIZED); }
-    let hip_err = hip_runtime_sys::hipGraphicsUnregisterResource(cu_to_hip_gfx_res(resource));
-    let result = hip_to_cuda_result(hip_err);
-    let code = match &result { Ok(_) => 0u32, Err(e) => e.0.get() };
-    trace_gl("cuGraphicsUnregisterResource", code);
-    result
-}
 
-#[cfg_attr(not(test), no_mangle)]
-#[allow(improper_ctypes)]
-#[allow(improper_ctypes_definitions)]
-pub unsafe extern "system" fn cuGraphicsMapResources(
-    count: ::core::ffi::c_uint,
-    resources: *mut cuda_types::cuda::CUgraphicsResource,
-    hStream: cuda_types::cuda::CUstream,
-) -> cuda_types::cuda::CUresult {
-    if !initialized() { return Err(CUerror::DEINITIALIZED); }
-    let hip_err = hip_runtime_sys::hipGraphicsMapResources(
-        count as ::core::ffi::c_int,
-        resources as *mut hip_runtime_sys::hipGraphicsResource_t,
-        hip_runtime_sys::hipStream_t(hStream.0 as *mut hip_runtime_sys::ihipStream_t),
-    );
-    let result = hip_to_cuda_result(hip_err);
-    let code = match &result { Ok(_) => 0u32, Err(e) => e.0.get() };
-    trace_gl("cuGraphicsMapResources", code);
-    result
-}
 
 #[cfg_attr(not(test), no_mangle)]
 #[allow(improper_ctypes)]
@@ -635,25 +510,6 @@ pub unsafe extern "system" fn cuGraphicsMapResources_ptsz(
     cuGraphicsMapResources(count, resources, hStream)
 }
 
-#[cfg_attr(not(test), no_mangle)]
-#[allow(improper_ctypes)]
-#[allow(improper_ctypes_definitions)]
-pub unsafe extern "system" fn cuGraphicsUnmapResources(
-    count: ::core::ffi::c_uint,
-    resources: *mut cuda_types::cuda::CUgraphicsResource,
-    hStream: cuda_types::cuda::CUstream,
-) -> cuda_types::cuda::CUresult {
-    if !initialized() { return Err(CUerror::DEINITIALIZED); }
-    let hip_err = hip_runtime_sys::hipGraphicsUnmapResources(
-        count as ::core::ffi::c_int,
-        resources as *mut hip_runtime_sys::hipGraphicsResource_t,
-        hip_runtime_sys::hipStream_t(hStream.0 as *mut hip_runtime_sys::ihipStream_t),
-    );
-    let result = hip_to_cuda_result(hip_err);
-    let code = match &result { Ok(_) => 0u32, Err(e) => e.0.get() };
-    trace_gl("cuGraphicsUnmapResources", code);
-    result
-}
 
 #[cfg_attr(not(test), no_mangle)]
 #[allow(improper_ctypes)]
@@ -708,50 +564,7 @@ pub unsafe extern "system" fn cuGraphicsResourceGetMappedPointer(
     cuGraphicsResourceGetMappedPointer_v2(pDevPtr, pSize, resource)
 }
 
-#[cfg_attr(not(test), no_mangle)]
-#[allow(improper_ctypes)]
-#[allow(improper_ctypes_definitions)]
-pub unsafe extern "system" fn cuGraphicsSubResourceGetMappedArray(
-    pArray: *mut cuda_types::cuda::CUarray,
-    resource: cuda_types::cuda::CUgraphicsResource,
-    arrayIndex: ::core::ffi::c_uint,
-    mipLevel: ::core::ffi::c_uint,
-) -> cuda_types::cuda::CUresult {
-    if !initialized() { return Err(CUerror::DEINITIALIZED); }
-    if pArray.is_null() {
-        trace_gl("cuGraphicsSubResourceGetMappedArray", 1);
-        return Err(CUerror::INVALID_VALUE);
-    }
-    let mut hip_arr: hip_runtime_sys::hipArray_t = std::ptr::null_mut();
-    let hip_err = hip_runtime_sys::hipGraphicsSubResourceGetMappedArray(
-        &mut hip_arr as *mut _,
-        cu_to_hip_gfx_res(resource),
-        arrayIndex,
-        mipLevel,
-    );
-    let result = hip_to_cuda_result(hip_err);
-    if result.is_ok() {
-        *pArray = hip_arr as cuda_types::cuda::CUarray;
-    }
-    let code = match &result { Ok(_) => 0u32, Err(e) => e.0.get() };
-    trace_gl("cuGraphicsSubResourceGetMappedArray", code);
-    result
-}
 
-#[cfg_attr(not(test), no_mangle)]
-#[allow(improper_ctypes)]
-#[allow(improper_ctypes_definitions)]
-pub unsafe extern "system" fn cuGraphicsResourceSetMapFlags_v2(
-    _resource: cuda_types::cuda::CUgraphicsResource,
-    _flags: ::core::ffi::c_uint,
-) -> cuda_types::cuda::CUresult {
-    if !initialized() { return Err(CUerror::DEINITIALIZED); }
-    // VEGA-FIX T17:24 sprint 71-agent: hipGraphicsResourceSetMapFlags NON esiste
-    // in amdhip64.dll Adrenalin v5.7. Stub graceful no-op SUCCESS (le flags
-    // di mapping non sono usate da AMD HIP runtime: pass-through trasparente).
-    trace_gl("cuGraphicsResourceSetMapFlags_v2", 0);
-    Ok(())
-}
 
 #[cfg_attr(not(test), no_mangle)]
 #[allow(improper_ctypes)]
@@ -855,25 +668,42 @@ macro_rules! implemented_in_function {
     };
 }
 
+#[cfg(windows)]
+macro_rules! implemented_windows {
+    ($($abi:literal fn $fn_name:ident( $($arg_id:ident : $arg_type:ty),* ) -> $ret_type:ty;)*) => {
+        implemented!($($abi fn $fn_name( $($arg_id : $arg_type),* ) -> $ret_type;)*);
+    }
+}
+
+#[cfg(not(windows))]
+macro_rules! implemented_windows {
+    ($($abi:literal fn $fn_name:ident( $($arg_id:ident : $arg_type:ty),* ) -> $ret_type:ty;)*) => {
+        unimplemented!($($abi fn $fn_name( $($arg_id : $arg_type),* ) -> $ret_type;)*);
+    }
+}
+
 cuda_macros::cuda_function_declarations!(
     unimplemented,
     implemented
         <= [
+            cuArray3DCreate_v2,
             cuCtxCreate_v2,
+            cuCtxCreate_v4,
             cuCtxDestroy_v2,
             cuCtxGetApiVersion,
             cuCtxGetCurrent,
-            cuCtxGetDevice,
             cuCtxGetDevice_v2,
+            cuCtxGetDevice,
             cuCtxGetLimit,
             cuCtxGetStreamPriorityRange,
-            cuCtxPopCurrent,
             cuCtxPopCurrent_v2,
-            cuCtxPushCurrent,
+            cuCtxPopCurrent,
             cuCtxPushCurrent_v2,
+            cuCtxPushCurrent,
             cuCtxSetCurrent,
             cuCtxSetFlags,
             cuCtxSetLimit,
+            cuCtxSynchronize_v2,
             cuCtxSynchronize,
             cuDeviceComputeCapability,
             cuDeviceGet,
@@ -882,19 +712,21 @@ cuda_macros::cuda_function_declarations!(
             cuDeviceGetLuid,
             cuDeviceGetName,
             cuDeviceGetProperties,
-            cuDeviceGetUuid,
             cuDeviceGetUuid_v2,
+            cuDeviceGetUuid,
             cuDevicePrimaryCtxGetState,
-            cuDevicePrimaryCtxRelease,
             cuDevicePrimaryCtxRelease_v2,
+            cuDevicePrimaryCtxRelease,
             cuDevicePrimaryCtxReset,
             cuDevicePrimaryCtxRetain,
-            cuDevicePrimaryCtxSetFlags,
             cuDevicePrimaryCtxSetFlags_v2,
+            cuDevicePrimaryCtxSetFlags,
             cuDeviceTotalMem_v2,
+            cuDeviceTotalMem,
             cuDriverGetVersion,
             cuEventCreate,
             cuEventDestroy_v2,
+            cuEventElapsedTime_v2,
             cuEventElapsedTime,
             cuEventQuery,
             cuEventRecord,
@@ -903,8 +735,8 @@ cuda_macros::cuda_function_declarations!(
             cuFuncSetAttribute,
             cuGetErrorString,
             cuGetExportTable,
-            cuGetProcAddress,
             cuGetProcAddress_v2,
+            cuGetProcAddress,
             cuGraphDestroy,
             cuGraphExecDestroy,
             cuGraphExecUpdate_v2,
@@ -912,9 +744,9 @@ cuda_macros::cuda_function_declarations!(
             cuGraphInstantiateWithFlags,
             cuGraphLaunch,
             cuInit,
+            cuKernelGetAttribute,
             cuKernelGetFunction,
             // VEGA-PATCH 2026-06-28 sprint-orch v2 nvcuda-8: cuKernelGetAttribute wiring (CUDA 12+ library API)
-            cuKernelGetAttribute,
             cuKernelSetAttribute,
             cuLaunchKernel,
             cuLaunchKernelEx,
@@ -932,28 +764,30 @@ cuda_macros::cuda_function_declarations!(
             cuMemCreate,
             cuMemRelease,
             cuMemFreeHost,
+            cuMemcpyAsync,
+            cuMemcpyDtoDAsync_v2,
+            cuMemcpyDtoH_v2_ptds,
+            cuMemcpyDtoH_v2,
+            cuMemcpyDtoHAsync_v2,
+            cuMemcpyHtoD_v2_ptds,
+            cuMemcpyHtoD_v2,
+            cuMemcpyHtoDAsync_v2,
             cuMemFree_v2,
             cuMemGetAddressRange_v2,
             cuMemGetAllocationGranularity,
             cuMemGetInfo_v2,
             cuMemHostAlloc,
             cuMemRetainAllocationHandle,
-            cuMemcpyAsync,
             // VEGA-PATCH 2026-06-28 sprint-orchestration: cuMemcpyAsync_ptsz delegate (PyTorch CUDA 12+ per-thread stream)
             cuMemcpyAsync_ptsz,
-            cuMemcpyDtoDAsync_v2,
-            cuMemcpyDtoH_v2_ptds,
-            cuMemcpyDtoHAsync_v2,
-            cuMemcpyDtoH_v2,
-            cuMemcpyHtoDAsync_v2,
-            cuMemcpyHtoD_v2,
-            cuMemcpyHtoD_v2_ptds,
             cuMemsetD32_v2,
-            cuMemsetD8Async,
             cuMemsetD8_v2,
+            cuMemsetD8Async,
             cuModuleGetFunction,
             cuModuleGetGlobal_v2,
             cuModuleGetLoadingMode,
+            cuModuleGetSurfRef,
+            cuModuleGetTexRef,
             cuModuleLoadData,
             cuModuleLoadDataEx,
             cuModuleLoadFatBinary,
@@ -970,9 +804,21 @@ cuda_macros::cuda_function_declarations!(
             cuStreamDestroy_v2,
             cuStreamEndCapture,
             cuStreamGetCaptureInfo_v2,
+            cuStreamGetCaptureInfo_v3,
             cuStreamIsCapturing,
             cuStreamSynchronize,
             cuStreamWaitEvent,
+            cuSurfObjectCreate,
+            cuSurfObjectDestroy,
+            cuSurfRefSetArray,
+            cuTexObjectCreate,
+            cuTexObjectDestroy,
+            cuTexRefSetAddress_v2,
+            cuTexRefSetAddressMode,
+            cuTexRefSetArray,
+            cuTexRefSetFilterMode,
+            cuTexRefSetFlags,
+            cuTexRefSetFormat,
             cuThreadExchangeStreamCaptureMode,
         ],
     implemented_in_function <= [cuLaunchKernel,],
@@ -994,13 +840,9 @@ cuda_macros::cuda_function_declarations!(
     //  generazione automatica del blocco `unimplemented` — altrimenti duplicate symbol linker
     //  error. Il macro `tex_real_external!` espande a NULLA: il body reale è già sopra.)
     tex_real_external <= [
-        cuTexObjectCreate,
-        cuTexObjectDestroy,
         cuTexObjectGetResourceDesc,
         cuTexObjectGetResourceViewDesc,
         cuTexObjectGetTextureDesc,
-        cuSurfObjectCreate,
-        cuSurfObjectDestroy,
         cuSurfObjectGetResourceDesc,
     ],
     // VEGA-PATCH 2026-06-30 T16:10 GL-INTEROP: 14 cuGL*/cuGraphics* IMPL REALE
@@ -1010,16 +852,11 @@ cuda_macros::cuda_function_declarations!(
     gl_real_external <= [
         cuGraphicsGLRegisterBuffer,
         cuGraphicsGLRegisterImage,
-        cuGraphicsUnregisterResource,
-        cuGraphicsMapResources,
         cuGraphicsMapResources_ptsz,
-        cuGraphicsUnmapResources,
         cuGraphicsUnmapResources_ptsz,
         cuGraphicsResourceGetMappedPointer,
         cuGraphicsResourceGetMappedPointer_v2,
-        cuGraphicsSubResourceGetMappedArray,
         cuGraphicsResourceSetMapFlags,
-        cuGraphicsResourceSetMapFlags_v2,
         cuGLGetDevices,
         cuGLGetDevices_v2,
         cuGLInit,
@@ -1083,7 +920,17 @@ cuda_macros::cuda_function_declarations!(
         cuCtxGetSharedMemConfig,
         cuModuleLoad,
         cuLaunchCooperativeKernel,
-    ]
+    ],
+    implemented_windows
+        <= [
+            cuD3D11GetDevice,
+            cuGraphicsD3D11RegisterResource,
+            cuGraphicsMapResources,
+            cuGraphicsResourceSetMapFlags_v2,
+            cuGraphicsSubResourceGetMappedArray,
+            cuGraphicsUnmapResources,
+            cuGraphicsUnregisterResource,
+        ],
 );
 
 #[cfg(test)]

@@ -3,6 +3,8 @@
 resolver = "2"
 
 members = [
+    "compiler",
+    "cuda_check",
     "cuda_macros",
     "cuda_types",
     "dark_api",
@@ -15,24 +17,34 @@ members = [
     "ext/miopen-sys",
     "ext/rocblas-sys",
     "format",
-    "ptx",
-    "ptx_parser",
-    "ptx_parser_macros",
+    "kernel_metadata",
+    "nvapi",
+    "nvapi_trace",
     "ptx_parser_macros_impl",
+    "ptx_parser_macros",
+    "ptx_parser",
+    "ptx",
     "ptxas",
     "xtask",
-    "zluda",
     "zluda_bindgen",
     "zluda_blas",
     "zluda_blaslt",
     "zluda_blaslt12",
     "zluda_cache",
-    "zluda_cufft",
     "zluda_common",
     "zluda_dnn",
     "zluda_dnn8",
     "zluda_dnn9",
-    "zluda_trace",
+    # cuFFT: upstream's zluda_fft (hipFFT, #672) replaces our former zluda_cufft,
+    # which stays out of the workspace (same `cufft` lib name).
+    "zluda_fft",
+    "zluda_inject",
+    "zluda_ld",
+    "zluda_ml",
+    "zluda_precompile",
+    "zluda_redirect",
+    "zluda_server_common",
+    "zluda_sparse",
     "zluda_trace_blas",
     "zluda_trace_blaslt",
     "zluda_trace_common",
@@ -41,37 +53,20 @@ members = [
     "zluda_trace_fft",
     "zluda_trace_nvml",
     "zluda_trace_sparse",
-    # zluda_fft (stub `unimplemented!`) sostituito dal nuovo zluda_cufft —
-    # disabilitato dal workspace per evitare conflitto `lib name = "cufft"`
-    # (cdylib duplicato). VEGA-PATCH 2026-06-30 TASK 5.
-    # "zluda_fft",
-    "zluda_inject",
-    "zluda_ld",
-    "zluda_ml",
-    "zluda_precompile",
-    "zluda_redirect",
-    "zluda_sparse",
+    "zluda_trace",
+    "zluda",
+    "zluda32",
+    "zluda64_server",
+    # 2 Solution (gfx906): runtime API, cuRAND, NVRTC and nvJitLink via hipRTC 5.7,
+    # graceful stubs for NCCL, cuSOLVER and nvJPEG.
     "zluda_windows",
     "zluda_cudart",
     "zluda_curand",
-    # VEGA-PATCH 2026-06-30 T18:30 GAP G1 — wrap nvrtc64_*.dll su hiprtc0507
-    # ROCm 5.7. Sblocca torch.compile + Triton + Inductor + flash-attn JIT.
-    # Worker 4/5 focus error handling: error.rs standalone (zero dep esterna).
     "zluda_nvrtc",
-    # VEGA-PATCH 2026-06-30 T16:05 — Stub graceful satellite DLL per
-    # superare LoadLibraryW/GetProcAddress feature-detect in PyTorch DDP /
-    # torch.linalg / torchvision GPU decoder / DALI. App reali (Blender,
-    # AutoCAD, training di LLM) chiamano nvcuda direttamente
-    # senza wrapper personalizzato — questi stub chiudono l'ultimo gap di
-    # init che bloccava la chain pristine system-call.
     "zluda_nccl",
     "zluda_cusolver",
     "zluda_nvjpeg",
-    # VEGA-PATCH 2026-06-30 T22:00 GAP G8 worker 2/5 — wrap nvJitLink_120_0.dll
-    # su hiprtc0507 ROCm 5.7 (riusa cu_link.rs T14:00). Sblocca Inductor cu12
-    # / Triton cu12 / NVCC-LTO offline pipeline. 12 export + Version bonus.
     "zluda_nvjitlink",
-    "compiler",
 ]
 
 default-members = ["zluda", "zluda_ml", "zluda_inject", "zluda_redirect", "compiler"]

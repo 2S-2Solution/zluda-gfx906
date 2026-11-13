@@ -1,28 +1,44 @@
 use cuda_types::cublas::*;
 use hip_runtime_sys::*;
+use libloading::Library;
 use rocblas_sys::*;
-use std::mem;
-use zluda_common::{from_cuda_object, ZludaObject};
+use std::ffi::OsStr;
+use std::{mem, ptr, sync::OnceLock};
+use zluda_common::os;
+use zluda_common::{constants, from_cuda_object, ZludaObject};
 
-pub struct Handle {
-    handle: rocblas_handle,
+fn rocblas() -> Result<&'static super::RocblasVtable, rocblas_error> {
+    static LOCK: OnceLock<Result<super::RocblasVtable, rocblas_error>> = OnceLock::new();
+    let unwrapped: &Result<super::RocblasVtable, rocblas_error> =
+        LOCK.get_or_init(|| unsafe { super::RocblasVtable::new() });
+    unwrapped.as_ref().map_err(|x| *x)
 }
 
-impl Handle {
-    fn new() -> Self {
-        Self {
-            handle: unsafe { mem::zeroed() },
-        }
-    }
+// This is repr(c) because it needs to be compatible with BlasHandle in zluda_blaslt.
+#[repr(C)]
+pub struct Handle {
+    blas_lt: usize,
+    blas_lt_library: Library,
+    rocm_handle: rocblas_handle,
 }
 
 impl ZludaObject for Handle {
-    const COOKIE: usize = 0x57c3fdb0fd72b08e;
-
+    const COOKIE: usize = constants::BLAS_HANDLE_COOKIE;
     type Error = cublasError_t;
     type CudaHandle = cublasHandle_t;
-
     fn drop_checked(&mut self) -> cublasStatus_t {
+        unsafe {
+            self.blas_lt_library
+                .get::<unsafe extern "system" fn(usize) -> cublasStatus_t>(b"cublasLtDestroy\0")
+        }
+        // Ignore any errors from destroying embedded blas_lt handle. It may have already been destroyed.
+        .map(|cublaslt_destroy| {
+            if self.blas_lt != 0 {
+                unsafe { cublaslt_destroy(self.blas_lt) };
+            }
+        })
+        .ok();
+        unsafe { rocblas()?.rocblas_destroy_handle(self.rocm_handle) }?;
         Ok(())
     }
 }
@@ -39,46 +55,72 @@ pub(crate) fn unimplemented() -> cublasStatus_t {
     cublasStatus_t::ERROR_NOT_SUPPORTED
 }
 
+#[cfg(windows)]
+pub(crate) fn get_cublaslt_file_name(file: &OsStr) -> Option<String> {
+    let file = file.to_string_lossy().to_lowercase();
+    if file.starts_with("cublas") {
+        Some("cublasLt".to_owned() + &file["cublas".len()..])
+    } else {
+        None
+    }
+}
+
+#[cfg(unix)]
+pub(crate) fn get_cublaslt_file_name(_file: &OsStr) -> Option<&'static str> {
+    Some("libcublaslt.so\0")
+}
+
 pub(crate) fn create_v2(handle: &mut cublasHandle_t) -> cublasStatus_t {
-    let mut zluda_blas_handle = Handle::new();
-    unsafe { rocblas_create_handle(&mut zluda_blas_handle.handle) }?;
-    *handle = Handle::wrap(zluda_blas_handle);
+    let mut self_path = os::self_path().ok_or(cublasError_t::INTERNAL_ERROR)?;
+    let file = self_path.file_name().ok_or(cublasError_t::INTERNAL_ERROR)?;
+    let cublaslt_file_name = get_cublaslt_file_name(file).ok_or(cublasError_t::INTERNAL_ERROR)?;
+    self_path.pop();
+    self_path.push(cublaslt_file_name);
+    let blas_lt_library = unsafe { libloading::Library::new(self_path) }
+        .map_err(|_| cublasError_t::INTERNAL_ERROR)?;
+    let mut blas_lt: usize = 0;
+    let cublaslt_create = unsafe {
+        blas_lt_library
+            .get::<unsafe extern "system" fn(*mut usize) -> cublasStatus_t>(b"cublasLtCreate\0")
+    }
+    .map_err(|_| cublasError_t::INTERNAL_ERROR)?;
+    // 2 Solution (gfx906): hipBLASLt is not part of our stack, so cublasLtCreate normally fails.
+    // The embedded cuBLASLt handle (upstream #587) is then left out (0) instead of failing
+    // cublasCreate, which would make every cuBLAS call unusable.
+    if unsafe { (cublaslt_create)(&mut blas_lt) }.is_err() {
+        blas_lt = 0;
+    }
+    let mut rocm_handle = rocblas_handle(ptr::null_mut());
+    unsafe { rocblas()?.rocblas_create_handle(&mut rocm_handle) }?;
+    *handle = Handle::wrap(Handle {
+        blas_lt: blas_lt as usize,
+        blas_lt_library,
+        rocm_handle,
+    });
     Ok(())
 }
 
-// VEGA-PATCH 2026-06-30 sprint-rust-final-T15:42 cublas-getstatusname: era todo!() panic
 pub(crate) fn get_status_name(status: cublasStatus_t) -> *const ::core::ffi::c_char {
-    let s: &'static [u8] = match status {
-        cublasStatus_t::SUCCESS => b"CUBLAS_STATUS_SUCCESS\0",
-        cublasStatus_t::ERROR_NOT_INITIALIZED => b"CUBLAS_STATUS_NOT_INITIALIZED\0",
-        cublasStatus_t::ERROR_ALLOC_FAILED => b"CUBLAS_STATUS_ALLOC_FAILED\0",
-        cublasStatus_t::ERROR_INVALID_VALUE => b"CUBLAS_STATUS_INVALID_VALUE\0",
-        cublasStatus_t::ERROR_ARCH_MISMATCH => b"CUBLAS_STATUS_ARCH_MISMATCH\0",
-        cublasStatus_t::ERROR_MAPPING_ERROR => b"CUBLAS_STATUS_MAPPING_ERROR\0",
-        cublasStatus_t::ERROR_EXECUTION_FAILED => b"CUBLAS_STATUS_EXECUTION_FAILED\0",
-        cublasStatus_t::ERROR_INTERNAL_ERROR => b"CUBLAS_STATUS_INTERNAL_ERROR\0",
-        cublasStatus_t::ERROR_NOT_SUPPORTED => b"CUBLAS_STATUS_NOT_SUPPORTED\0",
-        cublasStatus_t::ERROR_LICENSE_ERROR => b"CUBLAS_STATUS_LICENSE_ERROR\0",
-        _ => b"CUBLAS_STATUS_UNKNOWN\0",
-    };
-    s.as_ptr() as *const ::core::ffi::c_char
+    match status {
+        cublasStatus_t::SUCCESS => c"CUBLAS_STATUS_SUCCESS".as_ptr(),
+        cublasStatus_t::ERROR_NOT_INITIALIZED => c"CUBLAS_STATUS_NOT_INITIALIZED".as_ptr(),
+        cublasStatus_t::ERROR_ALLOC_FAILED => c"CUBLAS_STATUS_ALLOC_FAILED".as_ptr(),
+        cublasStatus_t::ERROR_INVALID_VALUE => c"CUBLAS_STATUS_INVALID_VALUE".as_ptr(),
+        cublasStatus_t::ERROR_ARCH_MISMATCH => c"CUBLAS_STATUS_ARCH_MISMATCH".as_ptr(),
+        cublasStatus_t::ERROR_MAPPING_ERROR => c"CUBLAS_STATUS_MAPPING_ERROR".as_ptr(),
+        cublasStatus_t::ERROR_EXECUTION_FAILED => c"CUBLAS_STATUS_EXECUTION_FAILED".as_ptr(),
+        cublasStatus_t::ERROR_INTERNAL_ERROR => c"CUBLAS_STATUS_INTERNAL_ERROR".as_ptr(),
+        cublasStatus_t::ERROR_NOT_SUPPORTED => c"CUBLAS_STATUS_NOT_SUPPORTED".as_ptr(),
+        cublasStatus_t::ERROR_LICENSE_ERROR => c"CUBLAS_STATUS_LICENSE_ERROR".as_ptr(),
+        _ => c"CUBLAS_STATUS_UNKNOWN".as_ptr(),
+    }
 }
 
 pub(crate) fn get_status_string(status: cublasStatus_t) -> *const ::core::ffi::c_char {
-    match status {
-        cublasStatus_t::SUCCESS => "CUBLAS_STATUS_SUCCESS\0",
-        cublasStatus_t::ERROR_NOT_INITIALIZED => "CUBLAS_STATUS_NOT_INITIALIZED\0",
-        cublasStatus_t::ERROR_ALLOC_FAILED => "CUBLAS_STATUS_ALLOC_FAILED\0",
-        cublasStatus_t::ERROR_INVALID_VALUE => "CUBLAS_STATUS_INVALID_VALUE\0",
-        cublasStatus_t::ERROR_ARCH_MISMATCH => "CUBLAS_STATUS_ARCH_MISMATCH\0",
-        cublasStatus_t::ERROR_MAPPING_ERROR => "CUBLAS_STATUS_MAPPING_ERROR\0",
-        cublasStatus_t::ERROR_EXECUTION_FAILED => "CUBLAS_STATUS_EXECUTION_FAILED\0",
-        cublasStatus_t::ERROR_INTERNAL_ERROR => "CUBLAS_STATUS_INTERNAL_ERROR\0",
-        cublasStatus_t::ERROR_NOT_SUPPORTED => "CUBLAS_STATUS_NOT_SUPPORTED\0",
-        cublasStatus_t::ERROR_LICENSE_ERROR => "CUBLAS_STATUS_LICENSE_ERROR\0",
-        _ => "CUBLAS_STATUS_UNKNOWN\0",
+    if cfg!(windows) && status.is_err() && status.err() == rocblas().err().map(Into::into) {
+        return c"rocblas.dll could not be found. Please install HIP SDK: https://zluda.readthedocs.io/latest/hip_sdk.html".as_ptr();
     }
-    .as_ptr() as *const ::core::ffi::c_char
+    get_status_name(status)
 }
 
 // VEGA-PATCH 2026-06-30 sprint-rust-final-T15:42 cublas-xerbla: no-op (Fortran-style error reporter)
@@ -96,7 +138,7 @@ pub(crate) fn get_cudart_version() -> usize {
 }
 
 pub(crate) fn set_math_mode(handle: &Handle, mode: rocblas_math_mode) -> cublasStatus_t {
-    unsafe { rocblas_set_math_mode(handle.handle, mode) }?;
+    unsafe { rocblas()?.rocblas_set_math_mode(handle.rocm_handle, mode) }?;
     Ok(())
 }
 
@@ -121,8 +163,8 @@ pub(crate) fn sgemm_strided_batched(
     batch_count: ::core::ffi::c_int,
 ) -> cublasStatus_t {
     unsafe {
-        rocblas_sgemm_strided_batched(
-            handle.handle,
+        rocblas()?.rocblas_sgemm_strided_batched(
+            handle.rocm_handle,
             transa,
             transb,
             m,
@@ -204,15 +246,15 @@ pub(crate) fn sgemm_v2(
     let mut owned_a: *mut ::core::ffi::c_void = core::ptr::null_mut();
     let (a_use, lda_use) = if need_pack_a {
         match unsafe {
-            materialize_contig(handle.handle, a as *const _, lda, a_rows, a_cols, core::mem::size_of::<f32>())
+            materialize_contig(handle.rocm_handle, a as *const _, lda, a_rows, a_cols, core::mem::size_of::<f32>())
         } {
             Some((p, ld)) => { owned_a = p; (p as *const f32, ld) }
             None => (a, lda),
         }
     } else { (a, lda) };
     let status = unsafe {
-        rocblas_sgemm(
-            handle.handle,
+        rocblas()?.rocblas_sgemm(
+            handle.rocm_handle,
             transa,
             transb,
             m,
@@ -241,11 +283,11 @@ pub(crate) unsafe fn set_pointer_mode_v2(
     handle: &Handle,
     mode: rocblas_pointer_mode,
 ) -> rocblas_status {
-    rocblas_set_pointer_mode(handle.handle, mode)
+    rocblas()?.rocblas_set_pointer_mode(handle.rocm_handle, mode)
 }
 
 pub(crate) unsafe fn set_stream_v2(handle: &Handle, stream: hipStream_t) -> rocblas_status {
-    rocblas_set_stream(handle.handle, stream)
+    rocblas()?.rocblas_set_stream(handle.rocm_handle, stream)
 }
 
 pub(crate) unsafe fn set_workspace_v2(
@@ -253,12 +295,12 @@ pub(crate) unsafe fn set_workspace_v2(
     workspace: *mut ::core::ffi::c_void,
     size: usize,
 ) -> rocblas_status {
-    rocblas_set_workspace(handle.handle, workspace, size)
+    rocblas()?.rocblas_set_workspace(handle.rocm_handle, workspace, size)
 }
 
 pub(crate) unsafe fn get_math_mode(handle: &Handle, mode: &mut cublasMath_t) -> rocblas_status {
     let mut roc_mode = mem::zeroed();
-    rocblas_get_math_mode(handle.handle, &mut roc_mode)?;
+    rocblas()?.rocblas_get_math_mode(handle.rocm_handle, &mut roc_mode)?;
     *mode = zluda_common::FromCuda::from_cuda(&roc_mode)?;
     Ok(())
 }
@@ -296,13 +338,13 @@ pub(crate) unsafe fn gemm_ex(
     let need_pack_a = elem > 0 && lda > a_rows;
     let mut owned_a: *mut ::core::ffi::c_void = core::ptr::null_mut();
     let (a_use, lda_use) = if need_pack_a {
-        match materialize_contig(handle.handle, a, lda, a_rows, a_cols, elem) {
+        match materialize_contig(handle.rocm_handle, a, lda, a_rows, a_cols, elem) {
             Some((p, ld)) => { owned_a = p; (p as *const ::core::ffi::c_void, ld) }
             None => (a, lda),
         }
     } else { (a, lda) };
-    let status = rocblas_gemm_ex(
-        handle.handle,
+    let status = rocblas()?.rocblas_gemm_ex(
+        handle.rocm_handle,
         transa,
         transb,
         m,
@@ -353,13 +395,13 @@ pub(crate) unsafe fn hgemm(
     let need_pack_a = lda > a_rows;
     let mut owned_a: *mut ::core::ffi::c_void = core::ptr::null_mut();
     let (a_use, lda_use) = if need_pack_a {
-        match materialize_contig(handle.handle, a as *const _, lda, a_rows, a_cols, 2) {
+        match materialize_contig(handle.rocm_handle, a as *const _, lda, a_rows, a_cols, 2) {
             Some((p, ld)) => { owned_a = p; (p as *const cuda_types::cublas::__half, ld) }
             None => (a, lda),
         }
     } else { (a, lda) };
-    let status = rocblas_hgemm(
-        handle.handle,
+    let status = rocblas()?.rocblas_hgemm(
+        handle.rocm_handle,
         transa,
         transb,
         m,
@@ -400,8 +442,8 @@ pub(crate) unsafe fn gemm_batched_ex(
     compute_type: rocblas_datatype,
     algo: rocblas_gemm_algo,
 ) -> rocblas_status {
-    rocblas_gemm_batched_ex(
-        handle.handle,
+    rocblas()?.rocblas_gemm_batched_ex(
+        handle.rocm_handle,
         transa,
         transb,
         m,
@@ -473,7 +515,7 @@ pub(crate) unsafe fn gemm_strided_batched_ex(
         let mut buf: *mut ::core::ffi::c_void = core::ptr::null_mut();
         if hipMalloc(&mut buf, total).is_ok() {
             let mut stream: hipStream_t = hipStream_t(core::ptr::null_mut());
-            let _ = rocblas_get_stream(handle.handle, &mut stream);
+            let _ = rocblas_get_stream(handle.rocm_handle, &mut stream);
             let dpitch = rows_u * elem;
             let spitch = (lda as usize) * elem;
             let mut ok = true;
@@ -488,8 +530,8 @@ pub(crate) unsafe fn gemm_strided_batched_ex(
             else { let _ = hipFree(buf); (a, lda, stride_a) }
         } else { (a, lda, stride_a) }
     } else { (a, lda, stride_a) };
-    let status = rocblas_gemm_strided_batched_ex(
-        handle.handle,
+    let status = rocblas()?.rocblas_gemm_strided_batched_ex(
+        handle.rocm_handle,
         transa,
         transb,
         m,
@@ -581,7 +623,7 @@ pub(crate) unsafe fn gemm_strided_batched_ex_64(
             let mut buf: *mut ::core::ffi::c_void = core::ptr::null_mut();
             if hipMalloc(&mut buf, total).is_ok() {
                 let mut stream: hipStream_t = hipStream_t(core::ptr::null_mut());
-                let _ = rocblas_get_stream(handle.handle, &mut stream);
+                let _ = rocblas_get_stream(handle.rocm_handle, &mut stream);
                 let dpitch = rows_u * elem;
                 let spitch = (lda as usize) * elem;
                 let mut ok = true;
@@ -598,7 +640,7 @@ pub(crate) unsafe fn gemm_strided_batched_ex_64(
         } else { (a, lda, stride_a) };
 
     let status = rocblas_gemm_strided_batched_ex_64(
-        handle.handle,
+        handle.rocm_handle,
         transa,
         transb,
         m, n, k,
@@ -633,7 +675,7 @@ pub(crate) fn sgemv_v2(
     y: *mut f32,
     incy: ::core::ffi::c_int,
 ) -> cublasStatus_t {
-    unsafe { rocblas_sgemv(handle.handle, trans, m, n, alpha, a, lda, x, incx, beta, y, incy) }?;
+    unsafe { rocblas_sgemv(handle.rocm_handle, trans, m, n, alpha, a, lda, x, incx, beta, y, incy) }?;
     Ok(())
 }
 
@@ -652,7 +694,7 @@ pub(crate) fn dgemv_v2(
     y: *mut f64,
     incy: ::core::ffi::c_int,
 ) -> cublasStatus_t {
-    unsafe { rocblas_dgemv(handle.handle, trans, m, n, alpha, a, lda, x, incx, beta, y, incy) }?;
+    unsafe { rocblas_dgemv(handle.rocm_handle, trans, m, n, alpha, a, lda, x, incx, beta, y, incy) }?;
     Ok(())
 }
 
@@ -666,7 +708,7 @@ pub(crate) fn saxpy_v2(
     y: *mut f32,
     incy: ::core::ffi::c_int,
 ) -> cublasStatus_t {
-    unsafe { rocblas_saxpy(handle.handle, n, alpha, x, incx, y, incy) }?;
+    unsafe { rocblas_saxpy(handle.rocm_handle, n, alpha, x, incx, y, incy) }?;
     Ok(())
 }
 
@@ -678,7 +720,7 @@ pub(crate) fn sscal_v2(
     x: *mut f32,
     incx: ::core::ffi::c_int,
 ) -> cublasStatus_t {
-    unsafe { rocblas_sscal(handle.handle, n, alpha, x, incx) }?;
+    unsafe { rocblas_sscal(handle.rocm_handle, n, alpha, x, incx) }?;
     Ok(())
 }
 
@@ -692,7 +734,7 @@ pub(crate) fn sdot_v2(
     incy: ::core::ffi::c_int,
     result: *mut f32,
 ) -> cublasStatus_t {
-    unsafe { rocblas_sdot(handle.handle, n, x, incx, y, incy, result) }?;
+    unsafe { rocblas_sdot(handle.rocm_handle, n, x, incx, y, incy, result) }?;
     Ok(())
 }
 
@@ -704,7 +746,7 @@ pub(crate) fn snrm2_v2(
     incx: ::core::ffi::c_int,
     result: *mut f32,
 ) -> cublasStatus_t {
-    unsafe { rocblas_snrm2(handle.handle, n, x, incx, result) }?;
+    unsafe { rocblas_snrm2(handle.rocm_handle, n, x, incx, result) }?;
     Ok(())
 }
 
@@ -716,7 +758,7 @@ pub(crate) fn sasum_v2(
     incx: ::core::ffi::c_int,
     result: *mut f32,
 ) -> cublasStatus_t {
-    unsafe { rocblas_sasum(handle.handle, n, x, incx, result) }?;
+    unsafe { rocblas_sasum(handle.rocm_handle, n, x, incx, result) }?;
     Ok(())
 }
 
@@ -728,7 +770,7 @@ pub(crate) unsafe fn set_vector(
     device_ptr: *mut ::core::ffi::c_void,
     incy: ::core::ffi::c_int,
 ) -> rocblas_status {
-    rocblas_set_vector(n, elem_size, x, incx, device_ptr, incy)
+    rocblas()?.rocblas_set_vector(n, elem_size, x, incx, device_ptr, incy)
 }
 
 pub(crate) unsafe fn get_vector(
@@ -739,7 +781,114 @@ pub(crate) unsafe fn get_vector(
     y: *mut ::core::ffi::c_void,
     incy: ::core::ffi::c_int,
 ) -> rocblas_status {
-    rocblas_get_vector(n, elem_size, x, incx, y, incy)
+    rocblas()?.rocblas_get_vector(n, elem_size, x, incx, y, incy)
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::tests::CublasApi;
+    use crate::tests::CublasLtApi;
+    use cuda_macros::test_cuda;
+
+    #[test_cuda]
+    fn create_destroy(api: impl CublasApi) {
+        let mut handle = unsafe { std::mem::zeroed() };
+        api.cublasCreate_v2(&mut handle);
+        api.cublasDestroy_v2(handle);
+    }
+
+    #[test_cuda]
+    fn can_pass_into_blaslt(api: impl CublasApi) {
+        use cuda_types::cublas::cublasComputeType_t;
+        use cuda_types::cuda::cudaDataType_t;
+
+        let mut handle = unsafe { std::mem::zeroed() };
+        api.cublasCreate_v2(&mut handle);
+
+        let mut pref = unsafe { std::mem::zeroed() };
+        api.blaslt().cublasLtMatmulPreferenceCreate(&mut pref);
+
+        let mut matmul_desc = unsafe { std::mem::zeroed() };
+        api.blaslt().cublasLtMatmulDescCreate(
+            &mut matmul_desc,
+            cublasComputeType_t::CUBLAS_COMPUTE_32F,
+            cudaDataType_t::CUDA_R_32F,
+        );
+
+        let m: u64 = 64;
+        let n: u64 = 64;
+        let k: u64 = 64;
+
+        let mut a_desc = unsafe { std::mem::zeroed() };
+        api.blaslt().cublasLtMatrixLayoutCreate(
+            &mut a_desc,
+            cudaDataType_t::CUDA_R_32F,
+            m,
+            k,
+            m as i64,
+        );
+
+        let mut b_desc = unsafe { std::mem::zeroed() };
+        api.blaslt().cublasLtMatrixLayoutCreate(
+            &mut b_desc,
+            cudaDataType_t::CUDA_R_32F,
+            k,
+            n,
+            k as i64,
+        );
+
+        let mut c_desc = unsafe { std::mem::zeroed() };
+        api.blaslt().cublasLtMatrixLayoutCreate(
+            &mut c_desc,
+            cudaDataType_t::CUDA_R_32F,
+            m,
+            n,
+            m as i64,
+        );
+
+        let mut d_desc = unsafe { std::mem::zeroed() };
+        api.blaslt().cublasLtMatrixLayoutCreate(
+            &mut d_desc,
+            cudaDataType_t::CUDA_R_32F,
+            m,
+            n,
+            m as i64,
+        );
+
+        let mut heuristic_result = unsafe { std::mem::zeroed() };
+        let mut return_algo_count: i32 = 0;
+        api.blaslt().cublasLtMatmulAlgoGetHeuristic(
+            unsafe { std::mem::transmute(handle) },
+            matmul_desc,
+            a_desc,
+            b_desc,
+            c_desc,
+            d_desc,
+            pref,
+            1,
+            &mut heuristic_result,
+            &mut return_algo_count,
+        );
+
+        api.blaslt().cublasLtMatrixLayoutDestroy(d_desc);
+        api.blaslt().cublasLtMatrixLayoutDestroy(c_desc);
+        api.blaslt().cublasLtMatrixLayoutDestroy(b_desc);
+        api.blaslt().cublasLtMatrixLayoutDestroy(a_desc);
+        api.blaslt().cublasLtMatmulDescDestroy(matmul_desc);
+        api.blaslt().cublasLtMatmulPreferenceDestroy(pref);
+        api.cublasDestroy_v2(handle);
+    }
+
+    #[test_cuda]
+    fn lt_destroy_blas_handle(api: impl CublasApi) {
+        let mut handle = unsafe { std::mem::zeroed() };
+        api.cublasCreate_v2(&mut handle);
+        api.blaslt()
+            .cublasLtDestroy(unsafe { std::mem::transmute(handle) });
+        let mut math_mode = unsafe { std::mem::zeroed() };
+        api.cublasGetMathMode(handle, &mut math_mode);
+        api.cublasDestroy_v2(handle);
+    }
 }
 
 // === VEGA-PATCH 2026-06-30 sprint-rust-final-T15:42 — Extension cublas L1 BLAS double + index ===
@@ -757,7 +906,7 @@ pub(crate) fn daxpy_v2(
     y: *mut f64,
     incy: ::core::ffi::c_int,
 ) -> cublasStatus_t {
-    unsafe { rocblas_daxpy(handle.handle, n, alpha, x, incx, y, incy) }?;
+    unsafe { rocblas_daxpy(handle.rocm_handle, n, alpha, x, incx, y, incy) }?;
     Ok(())
 }
 
@@ -769,7 +918,7 @@ pub(crate) fn dscal_v2(
     x: *mut f64,
     incx: ::core::ffi::c_int,
 ) -> cublasStatus_t {
-    unsafe { rocblas_dscal(handle.handle, n, alpha, x, incx) }?;
+    unsafe { rocblas_dscal(handle.rocm_handle, n, alpha, x, incx) }?;
     Ok(())
 }
 
@@ -783,7 +932,7 @@ pub(crate) fn ddot_v2(
     incy: ::core::ffi::c_int,
     result: *mut f64,
 ) -> cublasStatus_t {
-    unsafe { rocblas_ddot(handle.handle, n, x, incx, y, incy, result) }?;
+    unsafe { rocblas_ddot(handle.rocm_handle, n, x, incx, y, incy, result) }?;
     Ok(())
 }
 
@@ -795,7 +944,7 @@ pub(crate) fn dnrm2_v2(
     incx: ::core::ffi::c_int,
     result: *mut f64,
 ) -> cublasStatus_t {
-    unsafe { rocblas_dnrm2(handle.handle, n, x, incx, result) }?;
+    unsafe { rocblas_dnrm2(handle.rocm_handle, n, x, incx, result) }?;
     Ok(())
 }
 
@@ -807,7 +956,7 @@ pub(crate) fn dasum_v2(
     incx: ::core::ffi::c_int,
     result: *mut f64,
 ) -> cublasStatus_t {
-    unsafe { rocblas_dasum(handle.handle, n, x, incx, result) }?;
+    unsafe { rocblas_dasum(handle.rocm_handle, n, x, incx, result) }?;
     Ok(())
 }
 
@@ -820,7 +969,7 @@ pub(crate) fn scopy_v2(
     y: *mut f32,
     incy: ::core::ffi::c_int,
 ) -> cublasStatus_t {
-    unsafe { rocblas_scopy(handle.handle, n, x, incx, y, incy) }?;
+    unsafe { rocblas_scopy(handle.rocm_handle, n, x, incx, y, incy) }?;
     Ok(())
 }
 
@@ -833,7 +982,7 @@ pub(crate) fn dcopy_v2(
     y: *mut f64,
     incy: ::core::ffi::c_int,
 ) -> cublasStatus_t {
-    unsafe { rocblas_dcopy(handle.handle, n, x, incx, y, incy) }?;
+    unsafe { rocblas_dcopy(handle.rocm_handle, n, x, incx, y, incy) }?;
     Ok(())
 }
 
@@ -845,7 +994,7 @@ pub(crate) fn isamax_v2(
     incx: ::core::ffi::c_int,
     result: *mut ::core::ffi::c_int,
 ) -> cublasStatus_t {
-    unsafe { rocblas_isamax(handle.handle, n, x, incx, result) }?;
+    unsafe { rocblas_isamax(handle.rocm_handle, n, x, incx, result) }?;
     Ok(())
 }
 
@@ -857,7 +1006,7 @@ pub(crate) fn idamax_v2(
     incx: ::core::ffi::c_int,
     result: *mut ::core::ffi::c_int,
 ) -> cublasStatus_t {
-    unsafe { rocblas_idamax(handle.handle, n, x, incx, result) }?;
+    unsafe { rocblas_idamax(handle.rocm_handle, n, x, incx, result) }?;
     Ok(())
 }
 
@@ -866,7 +1015,7 @@ pub(crate) fn get_stream_v2(
     handle: &Handle,
     stream_id: *mut hipStream_t,
 ) -> cublasStatus_t {
-    unsafe { rocblas_get_stream(handle.handle, stream_id) }?;
+    unsafe { rocblas_get_stream(handle.rocm_handle, stream_id) }?;
     Ok(())
 }
 
@@ -875,7 +1024,7 @@ pub(crate) fn get_pointer_mode_v2(
     handle: &Handle,
     mode: *mut rocblas_pointer_mode,
 ) -> cublasStatus_t {
-    unsafe { rocblas_get_pointer_mode(handle.handle, mode) }?;
+    unsafe { rocblas_get_pointer_mode(handle.rocm_handle, mode) }?;
     Ok(())
 }
 
