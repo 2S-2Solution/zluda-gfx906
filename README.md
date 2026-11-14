@@ -29,6 +29,9 @@ Il pacchetto delle [Releases](https://github.com/2s-2solution/zluda-gfx906/relea
 - `cudnn64_8.dll`;
 - `nvrtc64_112_0.dll`.
 
+Dalla 2026.11.14 contiene anche `clang\clang.exe` (clang 24 della stessa LLVM di ZLUDA, vedi
+«Il clang dei kernel»).
+
 Le altre (cuFFT, cuRAND, cuSOLVER, `cudart64_12`, nvJitLink, nvJPEG, NCCL) si compilano dai
 sorgenti ma **non sono nel pacchetto** e non sono state validate.
 
@@ -37,7 +40,8 @@ sorgenti ma **non sono nel pacchetto** e non sono state validate.
 Componenti 2S, ciascuno nel proprio repository e con il proprio pacchetto:
 
 - **[rocm-marconi](https://github.com/2s-2solution/rocm-marconi)**, obbligatorio, versione del 12
-  novembre 2026 o successiva: quella che traduce l'ABI HIP 7.x verso la runtime 5.7. È il kit HIP
+  novembre 2026 o successiva (provato con la 2026.11.14): quella che traduce l'ABI HIP 7.x verso la
+  runtime 5.7. È il kit HIP
   5.7 e porta:
   - lo shim `amdhip64_7_shim.dll`;
   - rocBLAS con la libreria gfx906;
@@ -299,7 +303,8 @@ runtime.
   - stubs for nvJitLink, nvJPEG and NCCL that return "not supported" instead of crashing.
 
 The release package ships the six tested DLLs: `nvcuda`, `cublas64_11`, `cublasLt64_11`,
-`cudart64_110`, `cudnn64_8`, `nvrtc64_112_0`.
+`cudart64_110`, `cudnn64_8`, `nvrtc64_112_0`; since 2026.11.14 also `clang\clang.exe` (clang 24 from
+ZLUDA's own LLVM).
 
 **Requirements:**
 - [rocm-marconi](https://github.com/2s-2solution/rocm-marconi), mandatory: the HIP 5.7 shim,
