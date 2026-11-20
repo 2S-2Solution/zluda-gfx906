@@ -14,7 +14,7 @@ wave64)** con la runtime **HIP 5.7** del driver Windows. Le DLL che produce:
 
 | DLL prodotta | crate | cosa traduce |
 |---|---|---|
-| `nvcuda.dll` | `zluda` | driver API. Correzioni wave64 (shuffle via LDS, `bfind`, sort), modulo supplementare per i kernel elementwise `float` mancanti, ponte sullo stream nullo |
+| `nvcuda.dll` | `zluda` | driver API. Porta a wave64: il warp CUDA da 32 lane resta confinato nella sua metà della wavefront da 64 (shuffle con `ds_bpermute`, `laneid`, `lanemask_*`, ballot, vote, activemask), e così riduzioni e look-back di cub (sort, scan) danno il risultato giusto; `bfind` in tutte le forme (correzione del parser PTX); modulo supplementare per i kernel elementwise `float` mancanti, ponte sullo stream nullo |
 | `cudnn64_8.dll` | `zluda_dnn8` → `zluda_dnn` | cuDNN 8 verso MIOpen: tutti gli 86 simboli che importa `torch_cuda.dll` |
 | `cublas64_11.dll`, `cublasLt64_11.dll` | `zluda_blas`, `zluda_blaslt`, `zluda_blaslt12` | BLAS verso rocBLAS / hipBLASLt (incluse le varianti `_64`) |
 | `cudart64_110.dll`, `cudart64_12.dll` | `zluda_cudart` | runtime API |
@@ -265,14 +265,18 @@ stesso carico. ZLUDA resta utile per i programmi che arrivano solo in versione C
 - Le modifiche di upstream al livello cuDNN (`zluda_dnn`, per esempio `cudnnGetProperty`) non sono
   ancora integrate: il livello cuDNN è quello validato 86/86.
 - Alcune specializzazioni elementwise `float` assenti nella wheel (es. `pow`) richiedono un
-  ripiego su CPU. sort/argsort sono corretti fino a n=4096, non oltre 16384.
+  ripiego su CPU.
 - `torch.compile` / Inductor non sono supportati.
-- Segnalati nelle prove di agosto 2026 e non riverificati con questa versione: `torch.unique`
-  dà un conteggio sbagliato o un'eccezione; il backward di `nn.Embedding` con meno di 2048 indici
-  fallisce con l'errore 500 (kernel assente nel PTX della wheel).
+- Superati: i difetti di agosto 2026 su sort/argsort oltre n=4096, `torch.unique` e il backward di
+  `nn.Embedding` con meno di 2048 indici non si ripresentano. Nella prova estesa del 14 nov 2026
+  (28 operazioni contro la CPU) sono giusti sort fino a n=200000, argsort stabile int64 con
+  n=50000, cumsum int64 con n=100000, `unique` con conteggi e il backward di Embedding con 100 e
+  5000 indici.
 - Prestazioni: i kernel elementwise tradotti dal PTX raggiungevano circa 23 GB/s, contro i
   489 GB/s di una copia pura sulla stessa scheda, e un lancio costava circa 46 µs.
-- Un solo motore di calcolo per volta: è un limite del modello WDDM di Windows.
+- Più stream non danno velocità: sulla runtime 5.7 del driver i kernel su stream diversi non si sono
+  mai sovrapposti nelle nostre prove. L'ordine fra stream però non è garantito (la RNN multi-stream
+  di MIOpen aveva una corsa vera): le dipendenze fra stream vanno dichiarate con gli eventi.
 - Prove eseguite su una sola scheda; nessuna garanzia su altre GPU o driver.
 
 ## Licenza
@@ -292,7 +296,10 @@ programs on an **AMD Radeon VII (gfx906)** under **Windows**, on top of the driv
 runtime.
 
 **What it adds:**
-- wave64 fixes in the PTX translator: shuffles through LDS, `bfind`, sort;
+- a wave64 port of the PTX translator: each 32-lane CUDA warp is confined to its half of the
+  64-lane wavefront (shuffles with `ds_bpermute`, `laneid`, `lanemask_*`, ballot, vote,
+  activemask), which makes reductions and cub's look-back (sort, scan) correct;
+- a PTX parser fix: all forms of `bfind`, not only `bfind.shiftamt.u32`;
 - a supplementary code object for missing `float` elementwise kernels;
 - a null-stream bridge;
 - CUDA libraries mapped to AMD ones:
@@ -388,12 +395,15 @@ The native build [la-ruota](https://github.com/2s-2solution/la-ruota) is about 5
   `MAX_BLOCKS_PER_MULTIPROCESSOR` nor `MAX_REGISTERS_PER_MULTIPROCESSOR`, ZLUDA reports 0 and PyTorch
   divides by it. Already the case in 2026.11.12 (found on 13 Nov 2026).
 - Upstream's cuDNN changes are not merged yet; the cuDNN layer is the validated 86/86 one.
-- Reported in August 2026 and not re-verified with this version: `torch.unique` gives wrong counts
-  or raises; `nn.Embedding` backward with fewer than 2048 indices fails with error 500.
+- Fixed since August 2026: in the extended test of 14 Nov 2026 (28 operations against the CPU)
+  sort up to n=200000, stable int64 argsort (n=50000), int64 cumsum (n=100000), `unique` with
+  counts and `nn.Embedding` backward (100 and 5000 indices) are all correct.
+- Multiple streams give no speed-up (kernels on different streams never overlapped in our tests),
+  but ordering across streams is not guaranteed, so cross-stream dependencies need events.
 - Translated elementwise kernels reached about 23 GB/s, against 489 GB/s for a plain copy; a
   launch cost about 46 µs.
 - How the cuDNN layer was built: [docs/CUDNN_MIOPEN_gfx906.md](docs/CUDNN_MIOPEN_gfx906.md) (Italian).
-- Some `float` elementwise kernels fall back to the CPU; sort is correct up to n=4096.
+- Some `float` elementwise kernels fall back to the CPU.
 - No `torch.compile`.
 - Tested on a single card only.
 
