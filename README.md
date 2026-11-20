@@ -149,6 +149,13 @@ Il comando va in un file `.cmd`, come sopra; digitandolo direttamente nel prompt
   DLL di ZLUDA, poi per nome (il modulo già caricato o il `PATH`), poi `%MARCONI_ROOT%\bin`, e solo
   per ultimo `%HIP_PATH%\bin`. `HIP_PATH` può indicare un HIP SDK 6.x o 7.x, le cui librerie sono
   per un'altra runtime.
+- Shim HIP (`amdhip64_7_shim.dll`): si carica per nome, con l'ordine di ricerca normale di
+  Windows (il modulo già caricato, la cartella dell'eseguibile, System32, il `PATH`), **non**
+  dalla cartella di `nvcuda.dll`. Se nel `PATH` c'è prima uno shim più vecchio, ZLUDA si lega a
+  quello e perde la traduzione dell'ABI: per esempio `cuPointerGetAttributes` cade dentro
+  `hipDrvPointerGetAttributes` della runtime 5.7. Il bin del kit Marconi va quindi tenuto prima di
+  ogni altra cartella che contenga uno shim. Con PyTorch basta copiare lo shim in `torch\lib`,
+  perché PyTorch precarica tutte le DLL di quella cartella.
 - Cache dei moduli compilati: `ZLUDA_CACHE_DIR` se impostata, altrimenti
   `%LOCALAPPDATA%\zluda\ComputeCache`. Quest'ultima si trova con l'API Known Folder, che ignora la
   variabile `LOCALAPPDATA`: per tenere separata un'installazione di prova serve `ZLUDA_CACHE_DIR`.
@@ -354,6 +361,12 @@ CPU, plus PyTorch when it is hooked up. `disinstalla.cmd` reverts everything.
   the 5.7 runtime on the first kernel);
 - ROCm libraries: next to the ZLUDA DLL, then by name (already loaded or `PATH`), then
   `%MARCONI_ROOT%\bin`, and `%HIP_PATH%\bin` only last;
+- HIP shim (`amdhip64_7_shim.dll`): loaded by name with the normal Windows search order (already
+  loaded module, executable folder, System32, `PATH`), **not** from `nvcuda.dll`'s folder. An older
+  shim earlier on the `PATH` wins and the ABI translation is lost (e.g. `cuPointerGetAttributes`
+  crashes inside the 5.7 runtime's `hipDrvPointerGetAttributes`): keep the Marconi kit's `bin`
+  ahead of any other folder with a shim. With PyTorch, copying the shim into `torch\lib` is
+  enough, because PyTorch preloads every DLL in that folder;
 - module cache: `ZLUDA_CACHE_DIR`, else `%LOCALAPPDATA%\zluda\ComputeCache` (found through the Known
   Folder API, which ignores the `LOCALAPPDATA` variable);
 - default optimisation level -O0 (validated); `ZLUDA_OPT_LIVELLO=O3` is opt-in and unvalidated;
